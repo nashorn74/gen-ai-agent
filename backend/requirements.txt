@@ -4,3 +4,4 @@ sqlalchemy==1.4.46
 psycopg2-binary==2.9.6
 # asyncpg==0.27.0  # 비동기 DB 연결을 쓴다면 psycopg2 대신 asyncpg도 가능
 python-dotenv==0.21.0
+openai==0.27.0

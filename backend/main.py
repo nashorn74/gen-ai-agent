@@ -1,7 +1,7 @@
 # backend/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import user
+from routers import user, chat
 from database import engine
 import models
 
@@ -27,6 +27,7 @@ app.add_middleware(
 
 # 라우터 등록
 app.include_router(user.router)
+app.include_router(chat.router)
 
 @app.get("/")
 def read_root():
