@@ -1,79 +1,42 @@
-import { useState, useEffect } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+// src/App.tsx
+
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import LoginPage from "./pages/LoginPage";
+import RegisterPage from "./pages/RegisterPage";
+import ChatLayout from "./pages/ChatLayout";
+import PrivateRoute from "./components/PrivateRoute";
 
 function App() {
-  const [message, setMessage] = useState("");   // 백엔드에서 가져온 "Hello from FastAPI!"
-  const [question, setQuestion] = useState(""); // 사용자 입력 질문
-  const [answer, setAnswer] = useState("");     // OpenAI 응답
+  const token = localStorage.getItem("token");
 
-  // 기존 FastAPI 루트("/") 응답
-  useEffect(() => {
-    fetch("http://localhost:8000")
-      .then((res) => res.json())
-      .then((data) => {
-        setMessage(data.message);
-      })
-      .catch((err) => console.error(err));
-  }, []);
-
-  // 질문 전송 함수
-  const handleAsk = async () => {
-    try {
-      const res = await fetch("http://localhost:8000/chat", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ question: question }),
-      });
-      if (!res.ok) {
-        throw new Error(`Server error: ${res.status}`);
-      }
-      const data = await res.json();
-      setAnswer(data.answer); // { answer: "...GPT 응답..." }
-    } catch (error) {
-      console.error(error);
-      setAnswer("오류가 발생했습니다.");
-    }
-  };
+  // 만약 로그인되지 않았다면 기본 화면은 로그인 페이지로 이동
+  // 로그인되어 있으면 /chat으로 이동
+  const defaultRoute = token ? "/chat" : "/login";
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React + FastAPI</h1>
+    <BrowserRouter>
+      <Routes>
+        {/* 기본 루트 -> 토큰 있는지 확인 후 /chat or /login */}
+        <Route path="/" element={<Navigate to={defaultRoute} replace />} />
 
-      <p>Message from server: {message}</p>
+        {/* 로그인/회원가입 - 로그인전 상태에서도 접근 가능 */}
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/register" element={<RegisterPage />} />
 
-      <div style={{ marginTop: "2rem" }}>
-        <h2>Chat with OpenAI:</h2>
-        <div>
-          <input
-            type="text"
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            placeholder="질문을 입력하세요"
-            style={{ width: "300px" }}
-          />
-          <button onClick={handleAsk} style={{ marginLeft: "8px" }}>
-            Ask
-          </button>
-        </div>
-        {answer && (
-          <div style={{ marginTop: "1rem", whiteSpace: "pre-line" }}>
-            <strong>Answer:</strong> {answer}
-          </div>
-        )}
-      </div>
-    </>
+        {/* 채팅 페이지 - 로그인 안된 경우 접근 불가 */}
+        <Route 
+          path="/chat"
+          element={
+            <PrivateRoute>
+              <ChatLayout />
+            </PrivateRoute>
+          }
+        />
+
+        {/* Wildcard Not Found */}
+        <Route path="*" element={<div>Not Found</div>} />
+      </Routes>
+    </BrowserRouter>
   );
 }
 
