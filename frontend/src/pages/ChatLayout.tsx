@@ -1,5 +1,19 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import {
+  Box,
+  AppBar,
+  Toolbar,
+  Typography,
+  Button,
+  Drawer,
+  List,
+  ListItemButton,
+  ListItemText,
+  Divider,
+  Paper,
+  TextField
+} from "@mui/material";
 
 interface Message {
   message_id: number;
@@ -13,32 +27,31 @@ function ChatLayout() {
   const [userName, setUserName] = useState("");
   const [conversations, setConversations] = useState<any[]>([]);
   const [selectedConversation, setSelectedConversation] = useState<number | null>(null);
-
-  const [messages, setMessages] = useState<Message[]>([]); // 대화 메시지 목록
+  const [messages, setMessages] = useState<Message[]>([]);
   const [question, setQuestion] = useState("");
 
   useEffect(() => {
     const token = localStorage.getItem("token");
     if (!token) return;
 
-    // /auth/me
+    // 1) me
     fetch("http://localhost:8000/auth/me", {
       headers: { Authorization: `Bearer ${token}` }
     })
-      .then(res => res.ok ? res.json() : Promise.reject(res.statusText))
-      .then(data => { setUserName(data.username); })
-      .catch(err => console.error("Failed to get me:", err));
+      .then((res) => (res.ok ? res.json() : Promise.reject(res.statusText)))
+      .then((data) => setUserName(data.username))
+      .catch((err) => console.error("get me:", err));
 
-    // 대화 목록
+    // 2) conversation list
     fetch("http://localhost:8000/chat/conversations", {
       headers: { Authorization: `Bearer ${token}` }
     })
-      .then(res => res.ok ? res.json() : Promise.reject(res.statusText))
-      .then(data => setConversations(data))
-      .catch(err => console.error("Failed to get convos:", err));
+      .then((res) => (res.ok ? res.json() : Promise.reject(res.statusText)))
+      .then((data) => setConversations(data))
+      .catch((err) => console.error("get convos:", err));
   }, []);
 
-  // 대화 선택이 바뀔 때마다, 대화 상세를 불러옴
+  // load conversation detail
   useEffect(() => {
     const token = localStorage.getItem("token");
     if (!token) return;
@@ -46,16 +59,12 @@ function ChatLayout() {
       setMessages([]);
       return;
     }
-
     fetch(`http://localhost:8000/chat/conversations/${selectedConversation}`, {
       headers: { Authorization: `Bearer ${token}` }
     })
-      .then(res => res.ok ? res.json() : Promise.reject(res.statusText))
-      .then(data => {
-        // data.messages = [{message_id, role, content, created_at}...]
-        setMessages(data.messages);
-      })
-      .catch(err => console.error("Failed to get conv detail:", err));
+      .then((res) => (res.ok ? res.json() : Promise.reject(res.statusText)))
+      .then((data) => setMessages(data.messages))
+      .catch((err) => console.error(err));
   }, [selectedConversation]);
 
   const handleLogout = () => {
@@ -63,11 +72,9 @@ function ChatLayout() {
     navigate("/login");
   };
 
-  // 질문 전송
   const handleAsk = async () => {
     const token = localStorage.getItem("token");
     if (!token) return;
-
     try {
       const res = await fetch("http://localhost:8000/chat", {
         method: "POST",
@@ -85,99 +92,113 @@ function ChatLayout() {
       }
       const data = await res.json();
 
-      // 새 메시지 추가( user + assistant )
-      const newAssistantMsg = {
-        message_id: Date.now(), 
-        role: "assistant",
-        content: data.answer,
-        created_at: new Date().toISOString()
-      };
-      const newUserMsg = {
-        message_id: Date.now() + 1,
+      // 클라이언트 측에 메시지 반영
+      const userMsg: Message = {
+        message_id: Date.now(),
         role: "user",
         content: question,
         created_at: new Date().toISOString()
       };
+      const assistantMsg: Message = {
+        message_id: Date.now() + 1,
+        role: "assistant",
+        content: data.answer,
+        created_at: new Date().toISOString()
+      };
 
-      if (!data.conversation_id) {
-        // fallback
-        console.error("No conversation id from server??");
-      } else {
+      if (data.conversation_id) {
         setSelectedConversation(data.conversation_id);
       }
-      
-      // 실제 서버에선 conversation detail API 다시 불러와도 되지만,
-      // 여기서는 클라이언트 측 state로 간단히
-      setMessages([...messages, newUserMsg, newAssistantMsg]);
+
+      setMessages((prev) => [...prev, userMsg, assistantMsg]);
       setQuestion("");
-    } catch (error) {
-      console.error(error);
+    } catch (err) {
+      console.error(err);
     }
   };
 
   return (
-    <div style={{ display: "flex", height: "100vh" }}>
-      {/* Left sidebar: conversation list */}
-      <div style={{ width: "200px", borderRight: "1px solid #ccc", padding: "1rem" }}>
-        <h4>Conversations</h4>
-        <ul style={{ listStyle: "none", padding: 0 }}>
-          {conversations.map((c) => (
-            <li
-              key={c.conversation_id}
-              style={{
-                cursor: "pointer",
-                backgroundColor: c.conversation_id === selectedConversation ? "#ddd" : "transparent",
-                margin: "5px 0",
-                padding: "5px"
-              }}
-              onClick={() => setSelectedConversation(c.conversation_id)}
-            >
-              {c.title || `Conv ${c.conversation_id}`}
-            </li>
-          ))}
-        </ul>
-      </div>
+    <Box sx={{ display: "flex", height: "100vh" }}>
+      {/* 상단 바 */}
+      <AppBar position="fixed">
+        <Toolbar>
+          <Typography variant="h6" sx={{ flexGrow: 1 }}>
+            Chat App
+          </Typography>
+          <Typography sx={{ mr: 2 }}>{userName}</Typography>
+          <Button color="inherit" onClick={handleLogout}>
+            Logout
+          </Button>
+        </Toolbar>
+      </AppBar>
 
-      {/* Right panel: top bar + messages */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
-        {/* Top bar with user name and logout */}
-        <div style={{ height: "50px", borderBottom: "1px solid #ccc", display: "flex", justifyContent: "flex-end", alignItems: "center", padding: "0 1rem" }}>
-          <span style={{ marginRight: "1rem" }}>{userName}</span>
-          <button onClick={handleLogout}>Logout</button>
-        </div>
-
-        {/* Chat area */}
-        <div style={{ flex: 1, padding: "1rem" }}>
-          {!selectedConversation && (
-            <p>Select a conversation or ask a question to start a new one.</p>
-          )}
-
-          {selectedConversation && (
-            <>
-              {/* 메시지 목록을 채팅 형태로 표시 */}
-              <div style={{ marginBottom: "1rem", border: "1px solid #ccc", padding: "5px", height: "60vh", overflowY: "auto" }}>
-                {messages.map((m) => (
-                  <div key={m.message_id} style={{ margin: "5px 0" }}>
-                    <strong>{m.role}:</strong> {m.content}
-                  </div>
-                ))}
-              </div>
-
-              {/* 질문 입력 */}
-              <div style={{ display: "flex", gap: "8px" }}>
-                <input
-                  style={{ flex: 1 }}
-                  value={question}
-                  onChange={(e) => setQuestion(e.target.value)}
-                  placeholder="Ask something..."
+      {/* 왼쪽 Drawer (대화 목록) */}
+      <Drawer
+        variant="permanent"
+        sx={{
+          width: 240,
+          flexShrink: 0,
+          [`& .MuiDrawer-paper`]: {
+            width: 240,
+            top: "64px", // AppBar 높이, 만약 position fixed
+            boxSizing: "border-box"
+          }
+        }}
+      >
+        <Toolbar />
+        <Box sx={{ overflow: "auto" }}>
+          <List>
+            {conversations.map((c) => (
+              <ListItemButton
+                key={c.conversation_id}
+                selected={c.conversation_id === selectedConversation}
+                onClick={() => setSelectedConversation(c.conversation_id)}
+              >
+                <ListItemText
+                  primary={c.title || `Conv ${c.conversation_id}`}
                 />
-                <button onClick={handleAsk}>Send</button>
-              </div>
-            </>
-          )}
-        </div>
-      </div>
-    </div>
+              </ListItemButton>
+            ))}
+          </List>
+        </Box>
+      </Drawer>
+
+      {/* 메인 영역 */}
+      <Box sx={{ flexGrow: 1, marginTop: 8, p: 2 }}>
+        {!selectedConversation && (
+          <Typography>Select a conversation or ask a question to start.</Typography>
+        )}
+
+        {selectedConversation && (
+          <>
+            <Paper sx={{ mb: 2, height: "60vh", overflowY: "auto", p: 2 }}>
+              {messages.map((m) => (
+                <Box key={m.message_id} sx={{ mb: 1 }}>
+                  <Typography variant="subtitle2" color="text.secondary">
+                    {m.role}:
+                  </Typography>
+                  <Typography>{m.content}</Typography>
+                  <Divider sx={{ my: 1 }} />
+                </Box>
+              ))}
+            </Paper>
+
+            <Box sx={{ display: "flex", gap: 1 }}>
+              <TextField
+                fullWidth
+                label="Ask something..."
+                variant="outlined"
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+              />
+              <Button variant="contained" onClick={handleAsk}>
+                Send
+              </Button>
+            </Box>
+          </>
+        )}
+      </Box>
+    </Box>
   );
 }
 

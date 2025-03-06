@@ -2,6 +2,15 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
+// Material UI imports
+import {
+  Box,
+  Typography,
+  TextField,
+  Button,
+  Stack
+} from "@mui/material";
+
 function LoginPage() {
   const navigate = useNavigate();
 
@@ -30,7 +39,6 @@ function LoginPage() {
       localStorage.setItem("token", data.access_token);
 
       setMsg("Login success");
-      // 이동: /chat
       navigate("/chat");
     } catch (error: any) {
       setMsg(error.message);
@@ -42,29 +50,46 @@ function LoginPage() {
   };
 
   return (
-    <div style={{ margin: "2rem" }}>
-      <h2>Login</h2>
-      <form onSubmit={handleLogin}>
-        <div>
-          <label>Username: </label>
-          <input 
-            value={username} 
-            onChange={(e) => setUsername(e.target.value)}
-          />
-        </div>
-        <div>
-          <label>Password: </label>
-          <input 
-            type="password" 
-            value={password} 
-            onChange={(e) => setPassword(e.target.value)}
-          />
-        </div>
-        <button type="submit">Login</button>
-      </form>
-      <button onClick={goRegister}>Go to Register</button>
-      {msg && <p>{msg}</p>}
-    </div>
+    <Box sx={{ margin: 4 }}>
+      <Typography variant="h4" gutterBottom>
+        Login
+      </Typography>
+
+      <Box component="form" onSubmit={handleLogin} sx={{ maxWidth: 300 }}>
+        <TextField
+          label="Username"
+          variant="outlined"
+          fullWidth
+          margin="normal"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
+        <TextField
+          label="Password"
+          type="password"
+          variant="outlined"
+          fullWidth
+          margin="normal"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+
+        <Stack direction="row" spacing={2} sx={{ mt: 2 }}>
+          <Button variant="contained" type="submit">
+            Login
+          </Button>
+          <Button variant="outlined" onClick={goRegister}>
+            Go to Register
+          </Button>
+        </Stack>
+      </Box>
+
+      {msg && (
+        <Typography color="error" sx={{ mt: 2 }}>
+          {msg}
+        </Typography>
+      )}
+    </Box>
   );
 }
 

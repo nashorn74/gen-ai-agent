@@ -1,5 +1,12 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import {
+  Box,
+  Typography,
+  TextField,
+  Button,
+  Stack
+} from "@mui/material";
 
 function RegisterPage() {
   const navigate = useNavigate();
@@ -23,11 +30,8 @@ function RegisterPage() {
       }
       const data = await res.json();
       setMsg("Register success: " + JSON.stringify(data));
-
-      // 회원가입 성공 후 /login 이동
       navigate("/login");
     } catch (error: any) {
-      console.error(error);
       setMsg(error.message);
     }
   };
@@ -37,29 +41,46 @@ function RegisterPage() {
   };
 
   return (
-    <div style={{ margin: "2rem" }}>
-      <h2>Register</h2>
-      <form onSubmit={handleRegister}>
-        <div>
-          <label>Username: </label>
-          <input 
-            value={username} 
-            onChange={(e) => setUsername(e.target.value)}
-          />
-        </div>
-        <div>
-          <label>Password: </label>
-          <input 
-            type="password" 
-            value={password} 
-            onChange={(e) => setPassword(e.target.value)}
-          />
-        </div>
-        <button type="submit">Register</button>
-        <button type="button" onClick={handleCancel}>Cancel</button>
-      </form>
-      {msg && <p>{msg}</p>}
-    </div>
+    <Box sx={{ margin: 4 }}>
+      <Typography variant="h4" gutterBottom>
+        Register
+      </Typography>
+
+      <Box component="form" onSubmit={handleRegister} sx={{ maxWidth: 300 }}>
+        <TextField
+          label="Username"
+          variant="outlined"
+          fullWidth
+          margin="normal"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
+        <TextField
+          label="Password"
+          type="password"
+          variant="outlined"
+          fullWidth
+          margin="normal"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+
+        <Stack direction="row" spacing={2} sx={{ mt: 2 }}>
+          <Button variant="contained" type="submit">
+            Register
+          </Button>
+          <Button variant="outlined" onClick={handleCancel}>
+            Cancel
+          </Button>
+        </Stack>
+      </Box>
+
+      {msg && (
+        <Typography color="error" sx={{ mt: 2 }}>
+          {msg}
+        </Typography>
+      )}
+    </Box>
   );
 }
 
