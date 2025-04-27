@@ -1,6 +1,7 @@
 // src/pages/LoginPage.tsx
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useAuth } from "../contexts/AuthContext";
 
 // Material UI imports
 import {
@@ -13,6 +14,7 @@ import {
 
 function LoginPage() {
   const navigate = useNavigate();
+  const { setToken } = useAuth();
 
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -36,9 +38,8 @@ function LoginPage() {
       }
 
       const data = await res.json();
-      localStorage.setItem("token", data.access_token);
-
       setMsg("Login success");
+      setToken(data.access_token);   // ← localStorage + 전역 state 동시 반영
       navigate("/chat");
     } catch (error: any) {
       setMsg(error.message);

@@ -1,11 +1,26 @@
 fastapi==0.92.0
 uvicorn==0.20.0
+
+# ────── DB ──────
 sqlalchemy==1.4.46
 psycopg2-binary==2.9.6
-# asyncpg==0.27.0  # 비동기 DB 연결을 쓴다면 psycopg2 대신 asyncpg도 가능
-python-dotenv==0.21.0
-openai==0.27.0
+# asyncpg==0.27.0  # 필요 시 사용
+
+# ────── Auth / 보안 ──────
 passlib==1.7.4
 PyJWT==2.6.0
+python-jose[cryptography]==3.3.0     #  ← 추가 (jwt.decode/encode)
+
 python-multipart==0.0.5
+python-dotenv==0.21.0
+
+# ────── OpenAI / LLM ──────
+openai==0.27.0
+
+# ────── PDF 요약 ──────
 pdfplumber==0.9.0
+
+# ────── Google OAuth / Calendar ──────
+google-api-python-client==2.126.0     # discovery build
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0

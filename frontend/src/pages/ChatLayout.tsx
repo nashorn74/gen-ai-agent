@@ -1,22 +1,13 @@
 import { useEffect, useState, ChangeEvent } from "react";
 import { useNavigate } from "react-router-dom";
+import dayjs from "dayjs";
 import {
-  Box,
-  AppBar,
-  Toolbar,
-  Typography,
-  Button,
-  Drawer,
-  List,
-  ListItemButton,
-  ListItemText,
-  Divider,
-  Paper,
-  TextField,
-  Switch,
-  FormControlLabel,
-  LinearProgress,
+  Box, Drawer, Toolbar, List, ListItemButton, ListItemText, Divider,
+  AppBar, Typography, Button, Paper, TextField, Switch, FormControlLabel,
+  ListSubheader, Dialog, DialogTitle, DialogContent, DialogActions,
+  LinearProgress
 } from "@mui/material";
+import { fetchWithAuth } from "../utils/api";
 
 interface Message {
   message_id: number;
@@ -24,364 +15,293 @@ interface Message {
   content: string;
   created_at: string;
 }
+interface AgendaEvent {
+  id: string;
+  summary: string;
+  start: { dateTime?: string; date?: string };
+}
 
-function ChatLayout() {
+export default function ChatLayout() {
   const navigate = useNavigate();
 
-  const [userName, setUserName] = useState("");
+  // ───────── 상태 ─────────
+  const [userName, setUserName]           = useState("");
   const [conversations, setConversations] = useState<any[]>([]);
-  const [selectedConversation, setSelectedConversation] = useState<number | null>(null);
+  const [selectedConversation, setSelectedConversation] = useState<number|null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
 
-  const [question, setQuestion] = useState("");
-  const [searchMode, setSearchMode] = useState(false); // "정보 검색" 토글
+  const [question,    setQuestion]    = useState("");
+  const [searchMode,  setSearchMode]  = useState(false);
+  const [uploadFile,  setUploadFile]  = useState<File|null>(null);
+  const [isLoading,   setIsLoading]   = useState(false);
 
-  // 새로 추가: 파일 업로드/요약
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [agenda,      setAgenda]      = useState<AgendaEvent[]>([]);
+  const [gcConnected, setGcConnected] = useState(false);
 
-  // 로딩 상태
-  const [isLoading, setIsLoading] = useState(false);
+  // ─── 빠른 일정 Dialog ───
+  const [openQuick,   setOpenQuick]   = useState(false);
+  const [quickTitle,  setQuickTitle]  = useState("");
+  const [quickDate,   setQuickDate]   = useState(dayjs().format("YYYY-MM-DD"));
 
+  // ───────── 최초 로딩 ─────────
   useEffect(() => {
     const token = localStorage.getItem("token");
-    if (!token) return;
+    if (!token) { navigate("/login"); return; }
 
-    // 1) get user info
-    fetch("http://localhost:8000/auth/me", {
-      headers: { Authorization: `Bearer ${token}` }
-    })
-      .then((res) => (res.ok ? res.json() : Promise.reject(res.statusText)))
-      .then((data) => setUserName(data.username))
-      .catch((err) => console.error("get me:", err));
+    // 사용자 정보
+    fetchWithAuth("/auth/me").then(d => setUserName(d.username));
 
-    // 2) get conversation list
-    fetch("http://localhost:8000/chat/conversations", {
-      headers: { Authorization: `Bearer ${token}` }
-    })
-      .then((res) => (res.ok ? res.json() : Promise.reject(res.statusText)))
-      .then((data) => setConversations(data))
-      .catch((err) => console.error("get convos:", err));
+    // 대화 목록
+    fetchWithAuth("/chat/conversations").then(setConversations);
+
+    // 3일치 일정
+    const end = new Date(Date.now() + 3*86400*1000).toISOString();
+    fetchWithAuth(`/events?end=${end}`).then(setAgenda);
+
+    // Google 연결 여부
+    fetchWithAuth("/gcal/status").then(d => setGcConnected(d.connected));
   }, []);
 
-  // load messages when selectedConversation changes
+  // ─── 대화 선택 → 메시지 불러오기 ───
   useEffect(() => {
-    const token = localStorage.getItem("token");
-    if (!token) return;
-
-    if (!selectedConversation) {
-      // no conversation selected => clear messages
-      setMessages([]);
-      return;
-    }
-
-    // fetch conversation detail
-    fetch(`http://localhost:8000/chat/conversations/${selectedConversation}`, {
-      headers: { Authorization: `Bearer ${token}` }
-    })
-      .then((res) => (res.ok ? res.json() : Promise.reject(res.statusText)))
-      .then((data) => setMessages(data.messages))
-      .catch((err) => console.error("get conv detail error:", err));
+    if (!selectedConversation) { setMessages([]); return; }
+    fetchWithAuth(`/chat/conversations/${selectedConversation}`)
+      .then(d => setMessages(d.messages));
   }, [selectedConversation]);
 
-  const handleLogout = () => {
-    localStorage.removeItem("token");
-    navigate("/login");
+  // ─── Drawer Helper ───
+  const reloadAgenda = async () => {
+    const end = new Date(Date.now() + 3*86400*1000).toISOString();
+    setAgenda(await fetchWithAuth(`/events?end=${end}`));
   };
 
-  // 새 대화 시작 -> conversation_id=null, messages=[]
-  const handleNewConversation = () => {
+  const refreshGcalStatus = async () => {
+    const { connected } = await fetchWithAuth("/gcal/status");
+    setGcConnected(connected);
+  };
+
+  // ───────── Google Calendar 연결 / 해제 ─────────
+  const toggleGoogle = async () => {
+    if (!gcConnected) {
+      const { auth_url } = await fetchWithAuth("/gcal/authorize");
+      const popup = window.open(auth_url, "_blank", "width=500,height=650");
+      const handler = (e: MessageEvent) => {
+        if (e.data === "gcal_success") {
+          popup?.close();
+          window.removeEventListener("message", handler);
+          refreshGcalStatus();
+          reloadAgenda();
+        }
+      };
+      window.addEventListener("message", handler);
+    } else {
+      setGcConnected(false);
+      setAgenda([]);
+      
+      await fetchWithAuth("/gcal/disconnect", { method: "DELETE" });
+      refreshGcalStatus();      
+    }
+  };
+
+  const quickSave = async () => {
+    if (!quickTitle) return;           // 제목이 없으면 무시
+    setIsLoading(true);
+  
+    const token = localStorage.getItem("token")!;
+    const start = dayjs(quickDate).hour(9).minute(0).second(0);
+    const end   = start.add(1, "hour");
+  
+    await fetch("http://localhost:8000/events", {
+      method : "POST",
+      headers: {
+        "Content-Type" : "application/json",
+        Authorization  : `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        summary : quickTitle,
+        start   : start.toISOString(),
+        end     : end  .toISOString(),
+        timezone: "Europe/Berlin",
+      }),
+    });
+  
+    // 새 일정이 저장됐으니 3‑일 미리보기 다시 읽기
+    const until = new Date(Date.now() + 3*24*60*60*1000).toISOString();
+    const mini  = await fetchWithAuth(`/events?end=${until}`);
+    setAgenda(mini);
+  
+    setQuickTitle("");
+    setOpenQuick(false);
+    setIsLoading(false);
+  };
+
+  // ─── 새 대화 ───
+  const newConversation = () => {
     setSelectedConversation(null);
     setMessages([]);
   };
 
-  // 파일 첨부 시 
-  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-      setUploadFile(e.target.files[0]);
-    } else {
-      setUploadFile(null);
-    }
-  };
-
-  // 문서 파일 요약 버튼
-  const handleSummarizeUpload = async () => {
-    if (!uploadFile) return; // 파일 미선택시 무시
-
-    const token = localStorage.getItem("token");
-    if (!token) return;
+  // ─── 채팅 / 검색 요청 ───
+  const send = async () => {
+    if (!question.trim()) return;
 
     setIsLoading(true);
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone; // ex. "Europe/Berlin"
+    const endpoint = searchMode ? "/search" : "/chat";
+    const payload: any = {
+      conversation_id : selectedConversation,
+      question        : question,
+      timezone        : tz,
+    };
 
-    try {
-      const formData = new FormData();
-      formData.append("file", uploadFile);
-      if (selectedConversation) {
-        formData.append("conversation_id", String(selectedConversation));
-      }
+    const data = await fetchWithAuth(endpoint, { method:"POST", body:JSON.stringify(payload)});
+    if (data.conversation_id) setSelectedConversation(data.conversation_id);
 
-      const res = await fetch("http://localhost:8000/summarize", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`
-        },
-        body: formData
-      });
+    const now = Date.now();
+    setMessages(p => [
+      ...p,
+      {message_id:now  , role:"user",      content: searchMode ? `[검색] ${question}` : question, created_at:new Date().toISOString()},
+      {message_id:now+1, role:"assistant", content: searchMode ? data.final_answer   : data.answer, created_at:new Date().toISOString()}
+    ]);
 
-      if (!res.ok) {
-        throw new Error(`Summarize error: ${res.status}`);
-      }
-
-      const data = await res.json();
-      console.log("summarize result:", data);
-
-      if (data.conversation_id) {
-        setSelectedConversation(data.conversation_id);
-      }
-
-      // user message: "[파일요약] filename"
-      const userMsg: Message = {
-        message_id: Date.now(),
-        role: "user",
-        content: `[파일요약] ${uploadFile.name}`,
-        created_at: new Date().toISOString()
-      };
-      // assistant message: data.summary
-      const assistantMsg: Message = {
-        message_id: Date.now() + 1,
-        role: "assistant",
-        content: data.summary,
-        created_at: new Date().toISOString()
-      };
-
-      setMessages((prev) => [...prev, userMsg, assistantMsg]);
-      setUploadFile(null);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setIsLoading(false);
+    // 일정이 실제로 바뀌었을 수도 있으니 다시 가져오기
+    if (!searchMode && gcConnected) {
+      reloadAgenda();         // ➜ Drawer 의 다가오는 일정 즉시 업데이트
     }
+    setQuestion("");
+    setIsLoading(false);
   };
 
-  const handleAsk = async () => {
-    const token = localStorage.getItem("token");
-    if (!token) return;
-
+  // ─── 파일 요약 ───
+  const summarize = async () => {
+    if (!uploadFile) return;
     setIsLoading(true);
-    try {
-      const endpoint = searchMode
-        ? "http://localhost:8000/search"
-        : "http://localhost:8000/chat";
+    const fd = new FormData();
+    fd.append("file", uploadFile);
+    if (selectedConversation) fd.append("conversation_id", String(selectedConversation));
+    const data = await fetchWithAuth("/summarize", { method:"POST", body:fd, raw:true });
+    if (data.conversation_id) setSelectedConversation(data.conversation_id);
 
-      const bodyData: any = {
-        conversation_id: selectedConversation
-      };
-      if (searchMode) {
-        bodyData.query = question;
-      } else {
-        bodyData.question = question;
-      }
-
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`
-        },
-        body: JSON.stringify(bodyData)
-      });
-
-      if (!res.ok) {
-        throw new Error(`Error: ${res.status}`);
-      }
-
-      const data = await res.json();
-      console.log(data);
-
-      if (data.conversation_id) {
-        setSelectedConversation(data.conversation_id);
-      }
-
-      if (searchMode) {
-        // user: "[검색요청] question"
-        const userMsg: Message = {
-          message_id: Date.now(),
-          role: "user",
-          content: `[검색요청] ${question}`,
-          created_at: new Date().toISOString()
-        };
-        const assistantMsg: Message = {
-          message_id: Date.now() + 1,
-          role: "assistant",
-          content: data.final_answer,
-          created_at: new Date().toISOString()
-        };
-        setMessages((prev) => [...prev, userMsg, assistantMsg]);
-      } else {
-        // normal chat
-        const userMsg: Message = {
-          message_id: Date.now(),
-          role: "user",
-          content: question,
-          created_at: new Date().toISOString()
-        };
-        const assistantMsg: Message = {
-          message_id: Date.now() + 1,
-          role: "assistant",
-          content: data.answer,
-          created_at: new Date().toISOString()
-        };
-        setMessages((prev) => [...prev, userMsg, assistantMsg]);
-      }
-
-      setQuestion("");
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setIsLoading(false);
-    }
+    const now = Date.now();
+    setMessages(p => [
+      ...p,
+      {message_id:now,   role:"user",      content:`[파일요약] ${uploadFile.name}`, created_at:new Date().toISOString()},
+      {message_id:now+1, role:"assistant", content:data.summary,                    created_at:new Date().toISOString()}
+    ]);
+    setUploadFile(null);
+    setIsLoading(false);
   };
 
+  // ───────── 렌더링 ─────────
   return (
-    <Box sx={{ display: "flex", height: "100vh" }}>
-      {/* 상단 바 */}
-      <AppBar position="fixed">
-        <Toolbar>
-          <Typography variant="h6" sx={{ flexGrow: 1 }}>
-            Chat App
-          </Typography>
-          <Typography sx={{ mr: 2 }}>{userName}</Typography>
-          <Button color="inherit" onClick={handleLogout}>
-            Logout
-          </Button>
-        </Toolbar>
-      </AppBar>
-
-      {/* 왼쪽 Drawer (대화 목록 + "새 대화") */}
-      <Drawer
-        variant="permanent"
-        sx={{
-          width: 240,
-          flexShrink: 0,
-          [`& .MuiDrawer-paper`]: {
-            width: 240,
-            top: "64px",
-            boxSizing: "border-box"
-          }
-        }}
-      >
+    <Box sx={{ display:"flex", height:"100vh", overflow:"hidden" }}>
+      {/* ─── Drawer ─── */}
+      <Drawer variant="permanent" sx={{width:240,
+        [`& .MuiDrawer-paper`]:{width:240, top:64, boxSizing:"border-box"}}}>
         <Toolbar />
-        <Box sx={{ overflow: "auto" }}>
-          <List>
-            <ListItemButton
-              onClick={handleNewConversation}
-              sx={{ backgroundColor: "#f0f0f0" }}
-            >
-              <ListItemText primary="새로운 대화 시작" />
+        <List>
+          <ListItemButton sx={{bgcolor:"#f5f5f5"}} onClick={newConversation}>
+            <ListItemText primary="새로운 대화 시작"/>
+          </ListItemButton>
+          <Divider />
+          {conversations.map(c=>(
+            <ListItemButton key={c.conversation_id}
+              selected={c.conversation_id===selectedConversation}
+              onClick={()=>setSelectedConversation(c.conversation_id)}>
+              <ListItemText primary={c.title||`Conv ${c.conversation_id}`} />
             </ListItemButton>
-            <Divider />
-
-            {conversations.map((c) => (
-              <ListItemButton
-                key={c.conversation_id}
-                selected={c.conversation_id === selectedConversation}
-                onClick={() => setSelectedConversation(c.conversation_id)}
-              >
-                <ListItemText
-                  primary={c.title || `Conv ${c.conversation_id}`}
-                />
-              </ListItemButton>
-            ))}
-          </List>
-        </Box>
+          ))}
+        </List>
+        <Divider />
+        <List subheader={<ListSubheader>다가오는 일정</ListSubheader>}>
+          {agenda.map(ev=>(
+            <ListItemButton key={ev.id} onClick={()=>navigate(`/calendar?e=${ev.id}`)}>
+              <ListItemText
+                primary={ev.summary}
+                secondary={dayjs(ev.start.dateTime||ev.start.date).format("DD HH:mm")}
+              />
+            </ListItemButton>
+          ))}
+          {agenda.length===0 && (
+            <ListItemText sx={{p:2}} secondary="예정된 일정 없음"/>
+          )}
+        </List>
       </Drawer>
 
-      {/* 메인 영역 */}
-      <Box sx={{ flexGrow: 1, marginTop: 8, p: 2 }}>
-        {/* 만약 isLoading이면 상단에 LinearProgress 표시 */}
-        {isLoading && <LinearProgress sx={{ mb: 2 }} />}
+      {/* ─── Main ─── */}
+      <Box sx={{ flex:1, display:"flex", flexDirection:"column", minWidth:0 }}>
+        <AppBar position="relative" color="default" sx={{ zIndex:1200 }}>
+          <Toolbar>
+            <Typography sx={{ flexGrow:1 }}>대화</Typography>
+            <Button variant="outlined" onClick={toggleGoogle} sx={{mr:2}}>
+              {gcConnected ? "Google 연결 해제" : "Google 연결"}
+            </Button>
+            <Typography sx={{mr:2}}>{userName}</Typography>
+            <Button onClick={()=>{localStorage.removeItem("token");navigate("/login");}}>
+              Logout
+            </Button>
+          </Toolbar>
+        </AppBar>
 
-        {/* 메시지 목록 */}
-        <Paper sx={{ mb: 2, height: "60vh", overflowY: "auto", p: 2 }}>
-          {messages.length === 0 ? (
-            <Box key={1} sx={{ mb: 1 }}>
-              <Typography color="text.secondary">
-                대화 내용이 없습니다.
-              </Typography>
-              <Divider sx={{ my: 1 }} />
-            </Box>
-          ) : (
-            messages.map((m) => (
-              <Box key={m.message_id} sx={{ mb: 1 }}>
-                <Typography variant="subtitle2" color="text.secondary">
-                  {m.role}:
-                </Typography>
-                <Typography>{m.content}</Typography>
-                <Divider sx={{ my: 1 }} />
-              </Box>
-            ))
-          )}
+        {isLoading && <LinearProgress />}
+
+        <Paper sx={{ height: '60vh', m:2, p:2, overflowY:"auto" }}>
+          {messages.length===0
+            ? <Typography color="text.secondary">대화가 없습니다.</Typography>
+            : messages.map(m=>(
+                <Box key={m.message_id} sx={{mb:1}}>
+                  <Typography variant="subtitle2" color="text.secondary">{m.role}:</Typography>
+                  <Typography whiteSpace="pre-line">{m.content}</Typography>
+                  <Divider sx={{my:1}}/>
+                </Box>
+              ))}
         </Paper>
 
-        {/* 입력 + 검색 토글 + (파일 업로드 + "문서 파일 요약") */}
-        <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
-          <FormControlLabel
-            control={
-              <Switch
-                checked={searchMode}
-                onChange={(e) => setSearchMode(e.target.checked)}
-              />
-            }
-            label="정보검색"
-          />
-
-          <TextField
-            fullWidth
-            label="Ask something..."
-            variant="outlined"
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-          />
-
-          <Button
-            variant="contained"
-            onClick={handleAsk}
-            disabled={isLoading}
-          >
-            Send
-          </Button>
+        {/* 입력 */}
+        <Box sx={{m:2, display:"flex", gap:1}}>
+          <FormControlLabel control={
+            <Switch checked={searchMode} onChange={e=>setSearchMode(e.target.checked)}/>
+          } label="정보검색"/>
+          <TextField fullWidth label="메시지 입력" value={question}
+            onChange={e=>setQuestion(e.target.value)}
+            onKeyDown={e=>{if(e.key==="Enter") send();}}/>
+          <Button variant="contained" onClick={send} disabled={isLoading}>Send</Button>
         </Box>
 
-        {/* 파일 업로드 + 요약 버튼 */}
-        <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-          <Button
-            variant="outlined"
-            component="label"
-            disabled={isLoading}
-          >
+        {/* 파일 & 빠른 일정 */}
+        <Box sx={{m:2, display:"flex", gap:1}}>
+          <Button variant="outlined" component="label" disabled={isLoading}>
             파일 선택
-            <input
-              type="file"
-              hidden
-              accept=".pdf,.txt"
-              onChange={handleFileChange}
-            />
+            <input hidden type="file" accept=".pdf,.txt" onChange={(e:ChangeEvent<HTMLInputElement>)=>{
+              setUploadFile(e.target.files?.[0]||null);
+            }}/>
           </Button>
-
-          <Typography variant="body2">
+          <Typography variant="body2" sx={{flex:1}}>
             {uploadFile ? uploadFile.name : "선택된 파일 없음"}
           </Typography>
-
-          <Button
-            variant="contained"
-            onClick={handleSummarizeUpload}
-            disabled={isLoading || !uploadFile}
-          >
-            문서 파일 요약
+          <Button variant="contained" disabled={!uploadFile||isLoading} onClick={summarize}>
+            문서 요약
           </Button>
+          <Button variant="outlined" onClick={()=>setOpenQuick(true)}>빠른 일정</Button>
         </Box>
       </Box>
+
+      {/* 빠른 일정 Dialog */}
+      <Dialog open={openQuick} onClose={()=>setOpenQuick(false)}>
+        <DialogTitle>빠른 일정 추가</DialogTitle>
+        <DialogContent sx={{display:"flex",flexDirection:"column",gap:2,mt:1}}>
+          <TextField label="제목" value={quickTitle}
+            onChange={e=>setQuickTitle(e.target.value)}/>
+          <TextField type="date" label="날짜" InputLabelProps={{shrink:true}}
+            value={quickDate} onChange={e=>setQuickDate(e.target.value)}/>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={()=>setOpenQuick(false)}>취소</Button>
+          <Button onClick={quickSave} disabled={!quickTitle}>
+            저장
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }
-
-export default ChatLayout;

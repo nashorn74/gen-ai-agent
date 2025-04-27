@@ -1,18 +1,47 @@
 # backend/routers/chat.py
 
-import os
+import os, json
+import datetime as dt
+from zoneinfo import ZoneInfo 
 import openai
+from typing import Literal
 from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.orm import Session
 from database import SessionLocal
 import models
 from .auth import get_current_user_token  # JWT 인증 함수
+from .gcal  import build_gcal_service                  # Google service 헬퍼
+
+# 1) 로컬 타임존 결정
+try:
+    local_tz: ZoneInfo | dt.tzinfo = dt.datetime.now().astimezone().tzinfo  # ZoneInfo or timezone
+except Exception:
+    local_tz = dt.timezone.utc   # 극단적인 fallback
+
+# 2) 사람이 읽을 이름 얻기 (ZoneInfo.key 가 있으면 그걸, 없으면 tzname)
+def tz_label(tz: dt.tzinfo) -> str:
+    return getattr(tz, "key", None) or tz.tzname(None) or "UTC"
 
 openai.api_key = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_HERE")
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
+# ────────────────────────────── Pydantic ───────────────────────────────
+class ChatRequest(BaseModel):
+    conversation_id: int | None = None
+    question:        str
+    timezone:        str | None = None    # ex. "Europe/Berlin"
+
+class ToolResponse(BaseModel):
+    """GPT function‑call 이 내려올 경우 파라미터 스키마"""
+    action : Literal["create_event","delete_event"]
+    title  : str | None = None
+    start  : str | None = None     # ISO datetime
+    end    : str | None = None
+    event_id: str | None = None
+
+# ────────────────────────────── helpers ────────────────────────────────
 def get_db():
     db = SessionLocal()
     try:
@@ -20,84 +49,163 @@ def get_db():
     finally:
         db.close()
 
-class ChatRequest(BaseModel):
-    conversation_id: int | None = None
-    question: str
+def append_and_commit(db: Session, convo, role, content):
+    msg = models.Message(conversation_id = convo.id,
+                         role = role, content = content)
+    db.add(msg); db.commit()
 
-@router.post("/")
+@router.post("/", status_code=201)
 def chat(
     req: ChatRequest,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user_token)
+    db : Session       = Depends(get_db),
+    me : models.User   = Depends(get_current_user_token)
 ):
     """
-    - 반드시 JWT 필요 (현재 user가 누구인지)
-    - conversation_id 있으면 해당 대화 불러서 맥락 추가
-    - 없으면 새 conversation 생성
-    - GPT 호출 후 Message 테이블에 user/assistant 메시지 기록
+    하나의 엔드포인트에서
+    ① 일반질문   ② 일정 생성/삭제 명령(자연어) 모두 처리
     """
 
-    # 1) 기존 대화 로드(맥락)
-    messages_context = [
-        {"role": "system", "content": "You are a helpful assistant."}
-    ]
-    conversation_obj = None
-
+    # ── 0) 대화 객체 준비 ────────────────────────────
     if req.conversation_id:
-        conversation_obj = db.query(models.Conversation).filter_by(
-            id=req.conversation_id,
-            user_id=current_user.id
+        convo = db.query(models.Conversation).filter_by(
+            id=req.conversation_id, user_id=me.id
         ).first()
-        if not conversation_obj:
-            raise HTTPException(status_code=404, detail="Conversation not found or not yours")
+        if not convo:
+            raise HTTPException(404,"Conversation not found")
+    else:
+        convo = models.Conversation(user_id=me.id, title="Untitled chat")
+        db.add(convo); db.commit(); db.refresh(convo)
 
-        for msg in conversation_obj.messages:
-            messages_context.append({"role": msg.role, "content": msg.content})
+    # ── 1) 직전 메시지들 → GPT 컨텍스트 ───────────────
+    client_tz = ZoneInfo(req.timezone) if req.timezone else local_tz
+    now_client = dt.datetime.now(client_tz).isoformat()
+    
+    messages_ctx = [
+        {
+            "role": "system",
+            "content": (
+                "You are an AI assistant that can also manage the user's Google Calendar.\n"
+                "If the user asks to add, update or delete an event, respond with a function‑call.\n"
+                f"⏱️ **Current client time ({tz_label(client_tz)}):** {now_client}\n"
+                "Always interpret relative Korean expressions such as 오늘/내일/모레/오후 3시에 "
+                f"the client‑side timezone (**{tz_label(client_tz)}**) and make sure the "
+                "event is in the future."
+            )
+        }
+    ]
+    print(messages_ctx)
+    for m in convo.messages:
+        messages_ctx.append({"role":m.role,"content":m.content})
 
-    # 2) user 메시지 추가
-    messages_context.append({"role": "user", "content": req.question})
+    # 현재 user 질문 추가
+    messages_ctx.append({"role":"user","content":req.question})
+    append_and_commit(db, convo, "user", req.question)
 
-    # 3) GPT 호출
+    # ── 2) GPT 호출 (function‑calling) ────────────────
+    functions = [
+        {
+            "name":"create_event",
+            "description":"Create a new calendar event",
+            "parameters":{
+              "type":"object",
+              "properties":{
+                "title" :{"type":"string"},
+                "start" :{"type":"string","description":"ISO datetime"},
+                "end"   :{"type":"string","description":"ISO datetime"},
+              },
+              "required":["title","start","end"]
+            }
+        },
+        {
+            "name":"delete_event",
+            "description":"Delete an existing event",
+            "parameters":{
+              "type":"object",
+              "properties":{
+                "event_id":{"type":"string"}
+              },
+              "required":["event_id"]
+            }
+        }
+    ]
+
+    gpt = openai.ChatCompletion.create(
+        model       = "gpt-3.5-turbo-1106",
+        messages    = messages_ctx,
+        functions   = functions,
+        temperature = 0.3
+    )
+
+    choice   = gpt.choices[0]
+    finish   = choice.finish_reason
+    content  = choice.message.get("content")
+
+    # ── 3‑A) 일반 답변이면 그대로 반환 ────────────────
+    if finish != "function_call":
+        append_and_commit(db, convo, "assistant", content)
+        return {
+            "answer"         : content,
+            "conversation_id": convo.id
+        }
+
+    # ── 3‑B) function‑call 인 경우 ──────────────────
+    call   = choice.message.function_call
+    name   = call.name                    # "create_event" | "delete_event"
+    args   = json.loads(call.arguments or "{}")   # str → dict
+
+    # 구글 캘린더 연결 체크
+    token_row = db.query(models.GToken).filter_by(user_id=me.id).first()
+    if not token_row:
+        answer = "❗ Google 캘린더가 연결돼 있지 않아 일정을 처리할 수 없습니다."
+        append_and_commit(db, convo, "assistant", answer)
+        return {"answer": answer, "conversation_id": convo.id}
+
+    service = build_gcal_service(db, me.id)
+
     try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=messages_context
-        )
-        answer = resp.choices[0].message["content"]
+        if name == "create_event":
+            # 필수 파라미터 검증
+            for k in ("title", "start", "end"):
+                if k not in args:
+                    raise ValueError(f"missing {k}")
+
+            start_local = dt.datetime.fromisoformat(args["start"]).replace(tzinfo=client_tz)
+            end_local   = dt.datetime.fromisoformat(args["end"]).replace(tzinfo=client_tz)
+
+            ev = service.events().insert(
+                calendarId="primary",
+                body={
+                    "summary": args["title"],
+                    "start": {
+                        "dateTime": start_local.isoformat(timespec="seconds"),
+                        "timeZone": req.timezone or tz_label(client_tz)
+                    },
+                    "end": {
+                        "dateTime": end_local.isoformat(timespec="seconds"),
+                        "timeZone": req.timezone or tz_label(client_tz)
+                    },
+                },
+            ).execute()
+            answer = (f"✅ ‘{args['title']}’ 일정을 "
+                      f"{start_local.strftime('%Y‑%m‑%d %H:%M')}에 만들었어요!")
+
+        elif name == "delete_event":
+            if "event_id" not in args:
+                raise ValueError("missing event_id")
+
+            service.events().delete(
+                calendarId="primary", eventId=args["event_id"]
+            ).execute()
+            answer = "🗑️ 일정을 삭제했어요."
+
+        else:                                  # 정의되지 않은 함수명
+            answer = "⚠️ 알 수 없는 요청입니다."
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        answer = f"⚠️ 일정 처리 중 오류: {e}"
 
-    # 4) DB에 저장
-    if conversation_obj is None:
-        # 새 conversation 생성
-        conversation_obj = models.Conversation(
-            user_id=current_user.id,
-            title="Untitled Chat"
-        )
-        db.add(conversation_obj)
-        db.commit()
-        db.refresh(conversation_obj)
-
-    # user 메시지
-    user_msg = models.Message(
-        conversation_id=conversation_obj.id,
-        role="user",
-        content=req.question
-    )
-    # assistant 메시지
-    assistant_msg = models.Message(
-        conversation_id=conversation_obj.id,
-        role="assistant",
-        content=answer
-    )
-    db.add(user_msg)
-    db.add(assistant_msg)
-    db.commit()
-
-    return {
-        "answer": answer,
-        "conversation_id": conversation_obj.id
-    }
+    append_and_commit(db, convo, "assistant", answer)
+    return {"answer": answer, "conversation_id": convo.id}
 
 @router.get("/conversations")
 def get_conversations(

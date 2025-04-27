@@ -42,3 +42,38 @@ class Message(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     conversation = relationship("Conversation", back_populates="messages")
+
+class Event(Base):
+    __tablename__ = "events"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    title       = Column(String,  nullable=False)
+    description = Column(Text,    default="")
+    start_utc   = Column(DateTime, nullable=False)
+    end_utc     = Column(DateTime, nullable=False)
+    timezone    = Column(String,  default="UTC")
+
+    created_at  = Column(DateTime, server_default=func.now())
+
+    owner = relationship("User", back_populates="events")
+
+
+class GToken(Base):
+    """
+    Google OAuth 토큰 저장 테이블
+    access_token 이 만료되면 refresh_token 으로 자동 갱신
+    """
+    __tablename__ = "google_tokens"
+
+    user_id       = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    access_token  = Column(Text,  nullable=False)
+    refresh_token = Column(Text,  nullable=False)
+    expires_at    = Column(DateTime, nullable=False)
+
+
+# ── User 와의 관계 설정 ──────────────────────────
+User.events = relationship("Event",
+                            back_populates="owner",
+                            cascade="all, delete-orphan")
