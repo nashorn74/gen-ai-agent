@@ -9,11 +9,21 @@ import {
 } from "@mui/material";
 import { fetchWithAuth } from "../utils/api";
 
+interface RecommendCard {
+  card_id: string;
+  type: string;
+  title: string;
+  subtitle?: string;
+  link?: string;
+  reason?: string;
+  score?: number;
+}
 interface Message {
   message_id: number;
   role: string;
   content: string;
   created_at: string;
+  cards?: RecommendCard[];
 }
 interface AgendaEvent {
   id: string;
@@ -161,7 +171,13 @@ export default function ChatLayout() {
     setMessages(p => [
       ...p,
       {message_id:now  , role:"user",      content: searchMode ? `[검색] ${question}` : question, created_at:new Date().toISOString()},
-      {message_id:now+1, role:"assistant", content: searchMode ? data.final_answer   : data.answer, created_at:new Date().toISOString()}
+      {
+        message_id: now+1,
+        role: "assistant",
+        content: searchMode ? data.final_answer : data.answer,
+        cards: searchMode ? undefined : (data.cards ?? []),
+        created_at: new Date().toISOString(),
+      }
     ]);
 
     // 일정이 실제로 바뀌었을 수도 있으니 다시 가져오기
@@ -251,7 +267,34 @@ export default function ChatLayout() {
             : messages.map(m=>(
                 <Box key={m.message_id} sx={{mb:1}}>
                   <Typography variant="subtitle2" color="text.secondary">{m.role}:</Typography>
-                  <Typography whiteSpace="pre-line">{m.content}</Typography>
+                  {m.cards && m.cards.length>0 ? (
+                    <Box sx={{mt:1, mb:1, pl:2, borderLeft:"4px solid #ddd"}}>
+                      {m.cards.map(card=>(
+                        <Box key={card.card_id} sx={{mb:1}}>
+                          <Typography variant="subtitle1" fontWeight="bold">{card.title}</Typography>
+                          {card.subtitle && (
+                            <Typography variant="body2" color="text.secondary">
+                              {card.subtitle}
+                            </Typography>
+                          )}
+                          {card.link && (
+                            <Button size="small" variant="outlined"
+                              onClick={()=>window.open(card.link,"_blank")}>
+                              자세히
+                            </Button>
+                          )}
+                          {card.reason && (
+                            <Typography variant="caption" sx={{display:"block",mt:0.5}}>
+                              사유: {card.reason}
+                            </Typography>
+                          )}
+                          <Divider sx={{my:1}}/>
+                        </Box>
+                      ))}
+                    </Box>
+                  ) : (
+                    <Typography whiteSpace="pre-line">{m.content}</Typography>
+                  )}
                   <Divider sx={{my:1}}/>
                 </Box>
               ))}

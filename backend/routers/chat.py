@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.orm import Session
 from database import SessionLocal
 import models
+from models import Message, MessageRecommendationMap, RecCard
 from .auth import get_current_user_token  # JWT 인증 함수
 from .gcal  import build_gcal_service                  # Google service 헬퍼
 
@@ -49,10 +50,16 @@ def get_db():
     finally:
         db.close()
 
-def append_and_commit(db: Session, convo, role, content):
-    msg = models.Message(conversation_id = convo.id,
-                         role = role, content = content)
-    db.add(msg); db.commit()
+def append_and_commit(db, convo, role, content):
+    msg = Message(
+        conversation_id=convo.id,
+        role=role,
+        content=content
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    return msg
 
 @router.post("/", status_code=201)
 def chat(
@@ -89,7 +96,9 @@ def chat(
                 f"⏱️ **Current client time ({tz_label(client_tz)}):** {now_client}\n"
                 "Always interpret relative Korean expressions such as 오늘/내일/모레/오후 3시에 "
                 f"the client‑side timezone (**{tz_label(client_tz)}**) and make sure the "
-                "event is in the future."
+                "event is in the future.\n"
+                "If the user wants some recommendation (e.g. 어떤 콘텐츠 볼까요?), call `fetch_recommendations`."
+                "Otherwise, answer normally."
             )
         }
     ]
@@ -126,6 +135,24 @@ def chat(
               },
               "required":["event_id"]
             }
+        },
+        {
+            "name":"fetch_recommendations",
+            "description": "특정 타입(복수 가능)의 추천 카드를 가져온다",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "types": {
+                        "type": "string",
+                        "description": "콤마로 구분된 추천 타입. 예: 'content,learn'"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "가져올 카드 최대 개수"
+                    }
+                },
+                "required": ["types"]
+            }
         }
     ]
 
@@ -145,7 +172,8 @@ def chat(
         append_and_commit(db, convo, "assistant", content)
         return {
             "answer"         : content,
-            "conversation_id": convo.id
+            "conversation_id": convo.id,
+            "cards"          : []  # 일반 답변 시엔 카드 없음
         }
 
     # ── 3‑B) function‑call 인 경우 ──────────────────
@@ -154,13 +182,15 @@ def chat(
     args   = json.loads(call.arguments or "{}")   # str → dict
 
     # 구글 캘린더 연결 체크
-    token_row = db.query(models.GToken).filter_by(user_id=me.id).first()
-    if not token_row:
-        answer = "❗ Google 캘린더가 연결돼 있지 않아 일정을 처리할 수 없습니다."
-        append_and_commit(db, convo, "assistant", answer)
-        return {"answer": answer, "conversation_id": convo.id}
-
-    service = build_gcal_service(db, me.id)
+    if name == "create_event" or name == "delete_event":
+        token_row = db.query(models.GToken).filter_by(user_id=me.id).first()
+        if not token_row:
+            answer = "❗ Google 캘린더가 연결돼 있지 않아 일정을 처리할 수 없습니다."
+            append_and_commit(db, convo, "assistant", answer)
+            return {"answer": answer, "conversation_id": convo.id, "cards": []}
+        service = build_gcal_service(db, me.id)
+    
+    recs = []
 
     try:
         if name == "create_event":
@@ -198,14 +228,87 @@ def chat(
             ).execute()
             answer = "🗑️ 일정을 삭제했어요."
 
+        elif name == "fetch_recommendations":
+            # 1) 인수 파싱
+            from routers.recommend import get_recommendations
+            types = args.get("types", "")
+            limit = args.get("limit", 5)
+
+            # 백엔드 내부 함수 직접 호출
+            try:
+                recs = get_recommendations(
+                    types = types,
+                    limit = limit,
+                    db    = db,
+                    current_user = me,
+                    tz    = client_tz,
+                    user_query = req.question,
+                )
+                # recs 는 [{"card_id","type","title","subtitle","link","reason",...}, ...]
+
+                # 예시: 채팅 답변용 텍스트
+                if not recs:
+                    answer = "추천할 카드가 없네요!"
+                else:
+                    lines = []
+                    for r in recs:
+                        lines.append(f"• {r['title']} ({r['type']}) : {r['link']}")
+                    answer = "아래와 같은 추천 결과를 찾았습니다:\n\n" + "\n".join(lines)
+
+            except Exception as e:
+                answer = f"추천 조회 중 오류: {str(e)}"
+                recs = []
+            
+            # 메시지 먼저 생성
+            assistant_msg = append_and_commit(db, convo, "assistant", answer)
+
+            # recs = [{ "card_id":"c_12903","title":"...","type":"..."}, ...]
+            for i, r in enumerate(recs):
+                # rec_cards 테이블에서 해당 card_id 가 존재하는지 확인 (없으면 생성할 수도 있음)
+                card = db.query(RecCard).filter_by(id=r["card_id"]).first()
+
+                # 만약 card 자체가 DB에 없으면, 임시로 생성 예시 (원래는 미리 DB에 있음이 일반적)
+                if not card:
+                    card = RecCard(
+                        id       = r["card_id"],
+                        type     = r.get("type","content"),
+                        title    = r.get("title","Untitled"),
+                        subtitle = r.get("subtitle",""),
+                        url      = r.get("link",""),
+                        reason   = r.get("reason",""),
+                        tags     = r.get("tags", [])
+                    )
+                    db.add(card)
+                    db.commit()
+
+                mapping = MessageRecommendationMap(
+                    message_id = assistant_msg.id,
+                    rec_card_id = card.id,
+                    sort_order  = i
+                )
+                db.add(mapping)
+
+            db.commit()
+
+            return {
+                "answer": answer,
+                "conversation_id": convo.id,
+                "cards": recs
+            }
+
         else:                                  # 정의되지 않은 함수명
-            answer = "⚠️ 알 수 없는 요청입니다."
+            answer = "⚠️ 알 수 없는 function call"
 
     except Exception as e:
-        answer = f"⚠️ 일정 처리 중 오류: {e}"
+        answer = f"function call 처리 중 오류: {e}"
 
+    # DB에 assistant 메시지로 저장
     append_and_commit(db, convo, "assistant", answer)
-    return {"answer": answer, "conversation_id": convo.id}
+    return {
+        "answer"         : answer,
+        "conversation_id": convo.id,
+        "cards"          : recs
+    }
 
 @router.get("/conversations")
 def get_conversations(
@@ -245,11 +348,30 @@ def get_conversation_detail(
 
     messages = []
     for m in convo.messages:
+        # ↘ 추천 카드가 있으면, 관계를 통해 가져옴
+        card_list = []
+        for mr in m.recommendations:
+            c = mr.rec_card
+            # DB의 RecCard 정보를 JSON 형태로 변환
+            card_list.append({
+                "card_id"  : c.id,
+                "type"     : c.type,
+                "title"    : c.title,
+                "subtitle" : c.subtitle,
+                "link"     : c.url,
+                "reason"   : c.reason,
+                "tags"     : c.tags,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "sort_order": mr.sort_order  # 혹은 필요 없다면 생략
+            })
+
         messages.append({
             "message_id": m.id,
             "role": m.role,
             "content": m.content,
-            "created_at": m.created_at
+            "created_at": m.created_at,
+            # ★ 추가: cards
+            "cards": card_list
         })
 
     return {

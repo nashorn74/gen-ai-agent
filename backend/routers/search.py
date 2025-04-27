@@ -3,6 +3,7 @@
 import os
 import requests
 import openai
+from typing import List
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -27,6 +28,55 @@ def get_db():
 class SearchRequest(BaseModel):
     query: str
     conversation_id: int | None = None   # 새로 추가
+
+def google_search_cse(query: str, num=5, date_restrict=None, sort=None) -> List[dict]:
+    """
+    Google CSE를 호출해 결과 items[]를 합쳐서 반환.
+    items[i]는 {"title":..., "snippet":..., "link":...}를 포함.
+    만약 num > 10이면, 10개씩 페이징하여 여러 번 호출 후 결과를 합칩니다.
+    """
+    all_items: List[dict] = []
+    max_per_request = 10
+
+    # 페이징 계산
+    total_needed = max(num, 1)         # 최소 1
+    pages = (total_needed + max_per_request - 1) // max_per_request  # 올림
+
+    for page_index in range(pages):
+        # 이번 요청에서 가져올 개수(최대 10)
+        remaining = total_needed - len(all_items)
+        if remaining <= 0:
+            break
+
+        fetch_size = min(remaining, max_per_request)
+        start = page_index * max_per_request + 1  # 1-based index
+
+        # 공통 파라미터
+        params = {
+            "key" : GOOGLE_API_KEY,
+            "cx"  : GOOGLE_CSE_ID,
+            "q"   : query,
+            "lr"  : "lang_ko",
+            "num" : fetch_size,    # 이번에 가져올 개수 (최대 10)
+            "start": start,        # 다음 페이지 시작
+        }
+        if date_restrict:
+            params["dateRestrict"] = date_restrict
+        if sort:
+            params["sort"] = sort
+
+        resp = requests.get("https://www.googleapis.com/customsearch/v1", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+        batch = data.get("items", [])
+        all_items.extend(batch)
+
+        # 혹시 결과가 실제로 더 적게 나온 경우 중단
+        if len(batch) < fetch_size:
+            break
+
+    return all_items
 
 @router.post("/")
 def search_and_summarize(

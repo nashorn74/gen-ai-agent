@@ -1,6 +1,6 @@
 # backend/models.py
 
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, ARRAY
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
@@ -42,6 +42,11 @@ class Message(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     conversation = relationship("Conversation", back_populates="messages")
+    recommendations = relationship(
+        "MessageRecommendationMap",
+        back_populates="message",
+        cascade="all, delete-orphan"
+    )
 
 class Event(Base):
     __tablename__ = "events"
@@ -77,3 +82,39 @@ class GToken(Base):
 User.events = relationship("Event",
                             back_populates="owner",
                             cascade="all, delete-orphan")
+
+
+class RecCard(Base):
+    __tablename__ = "rec_cards"
+    id = Column(String, primary_key=True)   # 예: "c_123"
+    type = Column(String)                   # "content", "learn", etc.
+    title = Column(String)
+    subtitle = Column(String)
+    url = Column(String)
+    reason = Column(Text, nullable=True)    # LLM이나 규칙 기반으로 생성된 추천 사유
+    tags = Column(ARRAY(String), default=[])# 검색 및 필터용 태그
+    created_at = Column(DateTime, server_default=func.now())
+
+class RecImpression(Base):
+    __tablename__ = "rec_impressions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    card_id = Column(String, ForeignKey("rec_cards.id"), nullable=False)
+    action = Column(String)                  # "viewed"/"clicked"/"accepted"/"dismissed" ...
+    shown_at = Column(DateTime, server_default=func.now())
+
+    # 예: 필요하다면 관계도 설정
+    # card = relationship("RecCard")
+    # user = relationship("User")
+
+class MessageRecommendationMap(Base):
+    __tablename__ = "message_recommendation_map"
+    id = Column(Integer, primary_key=True, index=True)
+
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False)
+    rec_card_id = Column(String, ForeignKey("rec_cards.id"), nullable=False)
+    sort_order = Column(Integer, default=0)
+
+    # 필요 시 관계 설정
+    message = relationship("Message", back_populates="recommendations")
+    rec_card = relationship("RecCard")
