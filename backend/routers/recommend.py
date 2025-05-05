@@ -299,6 +299,22 @@ def get_recommendations(
     count = 0
     for c in candidates:
         if c.title not in seen_titles:
+            # feedback_logs 찾아본다
+            fb = db.query(models.FeedbackLog).filter_by(
+                user_id = current_user.id,
+                category="recommend",
+                reference_id=f"card_id={c.id}"   # or just c.id
+            ).first()
+
+            feedback_info = None
+            if fb:
+                feedback_info = {
+                    "feedback_id": fb.id,
+                    "feedback_score": fb.feedback_score,
+                    "feedback_label": fb.feedback_label,
+                    "details": fb.details
+                }
+
             result.append({
                 "card_id": c.id,
                 "type": c.type,
@@ -306,6 +322,7 @@ def get_recommendations(
                 "subtitle": c.subtitle,
                 "link": c.url,
                 "reason": c.reason,
+                "feedback": feedback_info
             })
             seen_titles.add(c.title)
             count += 1

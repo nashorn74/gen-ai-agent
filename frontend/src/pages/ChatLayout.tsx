@@ -5,9 +5,17 @@ import {
   Box, Drawer, Toolbar, List, ListItemButton, ListItemText, Divider,
   AppBar, Typography, Button, Paper, TextField, Switch, FormControlLabel,
   ListSubheader, Dialog, DialogTitle, DialogContent, DialogActions,
-  LinearProgress
+  LinearProgress, IconButton
 } from "@mui/material";
+import { ThumbUp, ThumbDown } from "@mui/icons-material";
 import { fetchWithAuth } from "../utils/api";
+
+interface FeedbackInfo {
+  feedback_id?: number;
+  feedback_score?: number;
+  feedback_label?: string;
+  details?: any;
+}
 
 interface RecommendCard {
   card_id: string;
@@ -17,6 +25,7 @@ interface RecommendCard {
   link?: string;
   reason?: string;
   score?: number;
+  feedback?: FeedbackInfo | null;
 }
 interface Message {
   message_id: number;
@@ -24,6 +33,7 @@ interface Message {
   content: string;
   created_at: string;
   cards?: RecommendCard[];
+  feedback?: FeedbackInfo | null;
 }
 interface AgendaEvent {
   id: string;
@@ -74,10 +84,22 @@ export default function ChatLayout() {
 
   // ─── 대화 선택 → 메시지 불러오기 ───
   useEffect(() => {
-    if (!selectedConversation) { setMessages([]); return; }
-    fetchWithAuth(`/chat/conversations/${selectedConversation}`)
-      .then(d => setMessages(d.messages));
+    if (!selectedConversation) {
+      setMessages([]);
+      return;
+    }
+    loadConversation(selectedConversation);
   }, [selectedConversation]);
+
+  // ───────── Helper: 대화/목록 로더 ─────────
+  const loadConversation = async (convId:number) => {
+    const d = await fetchWithAuth(`/chat/conversations/${convId}`);
+    setMessages(d.messages);
+  };
+  const loadConversationList = async () => {
+    const list = await fetchWithAuth("/chat/conversations");
+    setConversations(list);
+  };
 
   // ─── Drawer Helper ───
   const reloadAgenda = async () => {
@@ -165,25 +187,15 @@ export default function ChatLayout() {
     };
 
     const data = await fetchWithAuth(endpoint, { method:"POST", body:JSON.stringify(payload)});
-    if (data.conversation_id) setSelectedConversation(data.conversation_id);
-
-    const now = Date.now();
-    setMessages(p => [
-      ...p,
-      {message_id:now  , role:"user",      content: searchMode ? `[검색] ${question}` : question, created_at:new Date().toISOString()},
-      {
-        message_id: now+1,
-        role: "assistant",
-        content: searchMode ? data.final_answer : data.answer,
-        cards: searchMode ? undefined : (data.cards ?? []),
-        created_at: new Date().toISOString(),
-      }
-    ]);
-
-    // 일정이 실제로 바뀌었을 수도 있으니 다시 가져오기
-    if (!searchMode && gcConnected) {
-      reloadAgenda();         // ➜ Drawer 의 다가오는 일정 즉시 업데이트
+    if (data.conversation_id) {
+      // 업데이트: 선택대화 설정
+      setSelectedConversation(data.conversation_id);
+      // 메시지 목록 재로딩
+      await loadConversation(data.conversation_id);
+      // 대화 목록도 재로딩 (제목이 바뀌었을 수 있으니까)
+      await loadConversationList();
     }
+
     setQuestion("");
     setIsLoading(false);
   };
@@ -206,6 +218,60 @@ export default function ChatLayout() {
     ]);
     setUploadFile(null);
     setIsLoading(false);
+  };
+
+  // ★ 추가: 카드 피드백 전송 함수
+  const sendCardFeedback = async (card_id:string, label:string) => {
+    // POST /feedback (category="recommend", reference_id=`card_id=${card_id}`, feedback_label=label)
+    const body = {
+      category: "recommend",
+      reference_id: `card_id=${card_id}`,
+      feedback_label: label
+    };
+    try {
+      await fetchWithAuth("/feedback", {
+        method: "POST",
+        body: JSON.stringify(body)
+      });
+      // TODO: 업데이트된 피드백을 반영하기 위해, 대화 다시 로드 or 해당 메시지만 업데이트
+      if (selectedConversation) {
+        const data = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
+        setMessages(data.messages);
+      }
+    } catch(e) {
+      console.error(e);
+    }
+  };
+
+  // 메시지 피드백
+  const sendMessageFeedback = async (message_id:number, label:string) => {
+    // POST /feedback (category="chat", reference_id=`message_${message_id}`, feedback_label=label)
+    const body = {
+      category: "chat",
+      reference_id: `message_${message_id}`,
+      feedback_label: label
+    };
+    try {
+      await fetchWithAuth("/feedback", {
+        method: "POST",
+        body: JSON.stringify(body)
+      });
+      if (selectedConversation) {
+        const data = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
+        setMessages(data.messages);
+      }
+    } catch(e) {
+      console.error(e);
+    }
+  };
+
+  // ---- 아이콘 색상 구분 함수 (★추가)
+  const iconColor = (currentLabel: string|undefined, targetLabel:string) => {
+    if (currentLabel === targetLabel) {
+      // 좋아요 선택 => 녹색, 싫어요 선택 => 빨간색
+      return (targetLabel==="like") ? "success" : "error";
+    }
+    return "default";
   };
 
   // ───────── 렌더링 ─────────
@@ -264,9 +330,30 @@ export default function ChatLayout() {
         <Paper sx={{ height: '60vh', m:2, p:2, overflowY:"auto" }}>
           {messages.length===0
             ? <Typography color="text.secondary">대화가 없습니다.</Typography>
-            : messages.map(m=>(
+            : messages.map(m=>{
+              const isAssistant = (m.role==="assistant"); // ★ user=질문은 피드백X
+              return (
                 <Box key={m.message_id} sx={{mb:1}}>
                   <Typography variant="subtitle2" color="text.secondary">{m.role}:</Typography>
+
+                  {/* 메시지가 어시스턴트(답변)일때만 피드백 */}
+                  {isAssistant && (
+                    <Box sx={{display:"flex", gap:1, mt:1}}>
+                      <IconButton
+                        color={iconColor(m.feedback?.feedback_label,"like")}
+                        onClick={()=>sendMessageFeedback(m.message_id,"like")}
+                      >
+                        <ThumbUp fontSize="small" />
+                      </IconButton>
+                      <IconButton
+                        color={iconColor(m.feedback?.feedback_label,"dislike")}
+                        onClick={()=>sendMessageFeedback(m.message_id,"dislike")}
+                      >
+                        <ThumbDown fontSize="small" />
+                      </IconButton>
+                    </Box>
+                  )}
+
                   {m.cards && m.cards.length>0 ? (
                     <Box sx={{mt:1, mb:1, pl:2, borderLeft:"4px solid #ddd"}}>
                       {m.cards.map(card=>(
@@ -288,7 +375,22 @@ export default function ChatLayout() {
                               사유: {card.reason}
                             </Typography>
                           )}
-                          <Divider sx={{my:1}}/>
+                          
+                          {/* ---- 카드 피드백 */}
+                          <Box sx={{display:"flex", gap:1, mt:1}}>
+                            <IconButton
+                              color={iconColor(card.feedback?.feedback_label,"like")}
+                              onClick={()=>sendCardFeedback(card.card_id, "like")}
+                            >
+                              <ThumbUp fontSize="small" />
+                            </IconButton>
+                            <IconButton
+                              color={iconColor(card.feedback?.feedback_label,"dislike")}
+                              onClick={()=>sendCardFeedback(card.card_id, "dislike")}
+                            >
+                              <ThumbDown fontSize="small" />
+                            </IconButton>
+                          </Box>
                         </Box>
                       ))}
                     </Box>
@@ -297,7 +399,8 @@ export default function ChatLayout() {
                   )}
                   <Divider sx={{my:1}}/>
                 </Box>
-              ))}
+              );
+            })}
         </Paper>
 
         {/* 입력 */}

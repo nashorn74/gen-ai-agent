@@ -1,6 +1,6 @@
 # backend/models.py
 
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, ARRAY
+from sqlalchemy import Column, Integer, Float, String, ForeignKey, DateTime, Text, ARRAY, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
@@ -118,3 +118,16 @@ class MessageRecommendationMap(Base):
     # 필요 시 관계 설정
     message = relationship("Message", back_populates="recommendations")
     rec_card = relationship("RecCard")
+
+
+class FeedbackLog(Base):
+    __tablename__ = "feedback_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    category = Column(String)           # "recommend", "event", "search", "summarize", etc
+    reference_id = Column(String)       # ex) "card_id=...", "event_id=...", "file_id=...", etc
+    feedback_score = Column(Float, nullable=True)
+    feedback_label = Column(String, nullable=True)
+    details = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())

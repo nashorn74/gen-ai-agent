@@ -170,6 +170,11 @@ def chat(
     # ── 3‑A) 일반 답변이면 그대로 반환 ────────────────
     if finish != "function_call":
         append_and_commit(db, convo, "assistant", content)
+
+        # ★ 추가: 만약 title이 "Untitled chat" 이면 요약해서 제목으로 만들기
+        if convo.title == "Untitled chat":
+            summarize_conversation_title(db, convo)
+
         return {
             "answer"         : content,
             "conversation_id": convo.id,
@@ -187,6 +192,11 @@ def chat(
         if not token_row:
             answer = "❗ Google 캘린더가 연결돼 있지 않아 일정을 처리할 수 없습니다."
             append_and_commit(db, convo, "assistant", answer)
+
+            # ★ 추가: 제목 요약
+            if convo.title == "Untitled chat":
+                summarize_conversation_title(db, convo)
+
             return {"answer": answer, "conversation_id": convo.id, "cards": []}
         service = build_gcal_service(db, me.id)
     
@@ -290,6 +300,10 @@ def chat(
 
             db.commit()
 
+            # ★ 타이틀 요약
+            if convo.title == "Untitled chat":
+                summarize_conversation_title(db, convo)
+
             return {
                 "answer": answer,
                 "conversation_id": convo.id,
@@ -304,6 +318,11 @@ def chat(
 
     # DB에 assistant 메시지로 저장
     append_and_commit(db, convo, "assistant", answer)
+
+    # ★ 타이틀 요약
+    if convo.title == "Untitled chat":
+        summarize_conversation_title(db, convo)
+
     return {
         "answer"         : answer,
         "conversation_id": convo.id,
@@ -353,6 +372,21 @@ def get_conversation_detail(
         for mr in m.recommendations:
             c = mr.rec_card
             # DB의 RecCard 정보를 JSON 형태로 변환
+            card_fb = db.query(models.FeedbackLog).filter_by(
+                user_id = current_user.id,
+                category="recommend",
+                reference_id=f"card_id={c.id}"   # or just c.id
+            ).first()
+
+            card_feedback_info = None
+            if card_fb:
+                card_feedback_info = {
+                    "feedback_id": card_fb.id,
+                    "feedback_score": card_fb.feedback_score,
+                    "feedback_label": card_fb.feedback_label,
+                    "details": card_fb.details
+                }
+
             card_list.append({
                 "card_id"  : c.id,
                 "type"     : c.type,
@@ -360,18 +394,36 @@ def get_conversation_detail(
                 "subtitle" : c.subtitle,
                 "link"     : c.url,
                 "reason"   : c.reason,
+                "feedback" : card_feedback_info,
                 "tags"     : c.tags,
                 "created_at": c.created_at.isoformat() if c.created_at else None,
                 "sort_order": mr.sort_order  # 혹은 필요 없다면 생략
             })
+
+        # ----- (2) 메시지에 대한 피드백 로딩
+        # category="chat", reference_id=f"message_{m.id}", user_id=current_user.id
+        fb = db.query(models.FeedbackLog).filter_by(
+            user_id=current_user.id,
+            category="chat",
+            reference_id=f"message_{m.id}"
+        ).first()
+        if fb:
+            feedback_info = {
+                "feedback_id": fb.id,
+                "feedback_score": fb.feedback_score,
+                "feedback_label": fb.feedback_label,
+                "details": fb.details
+            }
+        else:
+            feedback_info = None
 
         messages.append({
             "message_id": m.id,
             "role": m.role,
             "content": m.content,
             "created_at": m.created_at,
-            # ★ 추가: cards
-            "cards": card_list
+            "cards": card_list,
+            "feedback": feedback_info   # ← ★ 메시지별 피드백 정보
         })
 
     return {
@@ -379,3 +431,50 @@ def get_conversation_detail(
         "title": convo.title,
         "messages": messages
     }
+
+# ★ 추가: 요약해서 convo.title 로 설정하는 함수
+def summarize_conversation_title(db: Session, convo: models.Conversation):
+    """
+    대화 내용(Message)을 간략히 요약하여 conversation.title 로 설정
+    """
+    # 1) 대화 내용을 하나의 문자열로 합침
+    text_parts = []
+    print(convo.messages)
+    for m in convo.messages:
+        # role: system, user, assistant
+        # 일단 user/assistant 메시지만 포함
+        if m.role in ("user", "assistant"):
+            text_parts.append(f"{m.role}: {m.content}")
+    joined_text = "\n".join(text_parts)
+    print(text_parts)
+    if not joined_text.strip():
+        return  # 대화가 비어있으면 그냥 둠
+
+    # 2) OpenAI 요청: "이 대화를 한 줄짜리 짧은 제목으로 요약"
+    system_prompt = (
+        "You are a helpful assistant. The user and assistant messages are shown. "
+        "Please create a concise conversation title in Korean, under 30 characters. "
+        "If there's no meaningful content, just return something like '메시지 없음'."
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": joined_text}
+    ]
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            max_tokens=30,
+            temperature=0.6
+        )
+        new_title = resp.choices[0].message["content"].strip()
+    except:
+        new_title = "(Untitled)"
+
+    # 제목 길이가 너무 길면 잘라냄 (30자)
+    if len(new_title) > 30:
+        new_title = new_title[:30].rstrip()
+
+    # DB 반영
+    convo.title = new_title
+    db.commit()
