@@ -7,6 +7,7 @@ from routers import search
 from routers import summarize
 from routers import recommend
 from routers import feedback
+from routers import profile
 from database import engine
 import models
 
@@ -40,6 +41,7 @@ app.include_router(gcal.router)        # /gcal/authorize · callback
 app.include_router(events_gcal.router) # /events CRUD
 app.include_router(recommend.router)
 app.include_router(feedback.router)
+app.include_router(profile.router)   # /profile
 
 @app.get("/")
 def read_root():

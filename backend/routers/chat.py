@@ -85,26 +85,36 @@ def chat(
 
     # ── 1) 직전 메시지들 → GPT 컨텍스트 ───────────────
     client_tz = ZoneInfo(req.timezone) if req.timezone else local_tz
-    now_client = dt.datetime.now(client_tz).isoformat()
+    now_local = dt.datetime.now(client_tz)
+    now_client = now_local.isoformat()      # 예: '2025-05-04T10:23:45.123456+09:00'
+
+    # 오늘/내일 날짜(‘YYYY-MM-DD’ 형태)
+    today_str = now_local.date().isoformat()  
+    tomorrow_str = (now_local.date() + dt.timedelta(days=1)).isoformat()
     
+    # 2) 시스템 메시지
+    system_content = (
+        "You are an AI assistant that can also manage the user's Google Calendar.\n"
+        "If the user asks to add, update or delete an event, respond with a function‑call.\n"
+        f"⏱️ **Current client time ({tz_label(client_tz)}):** {now_client}\n"
+        "Always interpret relative Korean expressions such as 오늘/내일/모레/오후 3시에 "
+        f"the client‑side timezone (**{tz_label(client_tz)}**) and make sure the "
+        "event is in the future.\n"
+        "If the user wants some recommendation (e.g. 어떤 콘텐츠 볼까요?), call `fetch_recommendations`.\n"
+        "Otherwise, answer normally.\n\n"
+
+        # ------ 여기서 날짜 강조 ------
+        f"IMPORTANT:\n"
+        f"오늘(‘today’)은 {today_str} 입니다. "
+        f"‘내일’(tomorrow)은 {tomorrow_str} 이므로 일정 계산 시 이 사실을 준수하세요.\n"
+    )
+
     messages_ctx = [
-        {
-            "role": "system",
-            "content": (
-                "You are an AI assistant that can also manage the user's Google Calendar.\n"
-                "If the user asks to add, update or delete an event, respond with a function‑call.\n"
-                f"⏱️ **Current client time ({tz_label(client_tz)}):** {now_client}\n"
-                "Always interpret relative Korean expressions such as 오늘/내일/모레/오후 3시에 "
-                f"the client‑side timezone (**{tz_label(client_tz)}**) and make sure the "
-                "event is in the future.\n"
-                "If the user wants some recommendation (e.g. 어떤 콘텐츠 볼까요?), call `fetch_recommendations`."
-                "Otherwise, answer normally."
-            )
-        }
+        {"role": "system", "content": system_content}
     ]
-    print(messages_ctx)
+    # 이전 대화(Conversation.messages) 쌓기
     for m in convo.messages:
-        messages_ctx.append({"role":m.role,"content":m.content})
+        messages_ctx.append({"role": m.role, "content": m.content})
 
     # 현재 user 질문 추가
     messages_ctx.append({"role":"user","content":req.question})

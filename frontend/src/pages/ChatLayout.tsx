@@ -9,6 +9,7 @@ import {
 } from "@mui/material";
 import { ThumbUp, ThumbDown } from "@mui/icons-material";
 import { fetchWithAuth } from "../utils/api";
+import ProfilingDialog from "../components/ProfilingDialog";
 
 interface FeedbackInfo {
   feedback_id?: number;
@@ -63,10 +64,19 @@ export default function ChatLayout() {
   const [quickTitle,  setQuickTitle]  = useState("");
   const [quickDate,   setQuickDate]   = useState(dayjs().format("YYYY-MM-DD"));
 
+  const [openProfileDlg, setOpenProfileDlg] = useState(false);
+
   // ───────── 최초 로딩 ─────────
   useEffect(() => {
     const token = localStorage.getItem("token");
     if (!token) { navigate("/login"); return; }
+
+    // 프로필 존재 여부 확인
+    fetchWithAuth("/profile")
+    .catch(err => {
+      // utils/api → fetchWithAuth 가 404 일 때 err.status 반환하도록 가정
+      if (err.status === 404) setOpenProfileDlg(true);
+    });
 
     // 사용자 정보
     fetchWithAuth("/auth/me").then(d => setUserName(d.username));
@@ -188,12 +198,17 @@ export default function ChatLayout() {
 
     const data = await fetchWithAuth(endpoint, { method:"POST", body:JSON.stringify(payload)});
     if (data.conversation_id) {
-      // 업데이트: 선택대화 설정
+      // 1) 해당 대화를 선택 (title 등 변동 가능)
       setSelectedConversation(data.conversation_id);
-      // 메시지 목록 재로딩
+
+      // 2) 메시지 목록(대화 상세) 다시 로딩
       await loadConversation(data.conversation_id);
-      // 대화 목록도 재로딩 (제목이 바뀌었을 수 있으니까)
+
+      // 3) 대화 목록(제목 혹은 정렬이 바뀌었을 수 있으니) 다시 로딩
       await loadConversationList();
+
+      // 4) 일정도 다시 불러오기 (3일치)
+      await reloadAgenda();
     }
 
     setQuestion("");
@@ -448,6 +463,11 @@ export default function ChatLayout() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      <ProfilingDialog
+        open={openProfileDlg}
+        onClose={()=>setOpenProfileDlg(false)}
+      />
     </Box>
   );
 }

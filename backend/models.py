@@ -1,6 +1,7 @@
 # backend/models.py
 
 from sqlalchemy import Column, Integer, Float, String, ForeignKey, DateTime, Text, ARRAY, JSON
+from sqlalchemy import Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
@@ -131,3 +132,47 @@ class FeedbackLog(Base):
     feedback_label = Column(String, nullable=True)
     details = Column(JSON, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+
+
+# ──────────────────────────────────────────────────────────────
+# ① 프로필 메타(온보딩 완료 여부, 언어, 동의 버전 …)
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
+
+    user_id      = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    locale       = Column(String(5), default="ko")
+    consent      = Column(Boolean, nullable=False)
+    completed_on = Column(DateTime)
+
+    # 역참조
+    user = relationship("User", back_populates="profile")
+
+# ──────────────────────────────────────────────────────────────
+# ② 취향/선호 테이블 (장르, 학습 태그, 일반 태그 …)
+class UserPrefGenre(Base):
+    __tablename__ = "user_pref_genres"
+    user_id   = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    genre     = Column(String(20), primary_key=True)      # ex) action
+    score     = Column(Integer)   # 1~5
+
+class UserPrefTag(Base):
+    """
+    다양한 태그(학습 목표·관심 분야·선호 콘텐츠 형식 등)를
+    하나의 테이블에서 통합 관리
+    """
+    __tablename__ = "user_pref_tags"
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    tag_type = Column(String(20), primary_key=True)       # genre/learning/interest/content_type/tool …
+    tag      = Column(String(50), primary_key=True)
+    weight   = Column(Float, default=1.0)
+
+# ──────────────────────────────────────────────────────────────
+# ③ User ↔ Profile 관계 매핑
+User.profile     = relationship("UserProfile",
+                                uselist=False,
+                                back_populates="user",
+                                cascade="all, delete-orphan")
+User.pref_genres = relationship("UserPrefGenre",
+                                cascade="all, delete-orphan")
+User.pref_tags   = relationship("UserPrefTag",
+                                cascade="all, delete-orphan")
