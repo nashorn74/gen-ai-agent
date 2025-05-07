@@ -47,6 +47,7 @@ export default function ChatLayout() {
 
   // ───────── 상태 ─────────
   const [userName, setUserName]           = useState("");
+  const [profileExists, setProfileExists] = useState(false);
   const [conversations, setConversations] = useState<any[]>([]);
   const [selectedConversation, setSelectedConversation] = useState<number|null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -73,9 +74,13 @@ export default function ChatLayout() {
 
     // 프로필 존재 여부 확인
     fetchWithAuth("/profile")
+    .then(()=> setProfileExists(true))
     .catch(err => {
       // utils/api → fetchWithAuth 가 404 일 때 err.status 반환하도록 가정
-      if (err.status === 404) setOpenProfileDlg(true);
+      if (err.status===404) {
+        setProfileExists(false);
+        setOpenProfileDlg(true);
+      }
     });
 
     // 사용자 정보
@@ -120,6 +125,16 @@ export default function ChatLayout() {
   const refreshGcalStatus = async () => {
     const { connected } = await fetchWithAuth("/gcal/status");
     setGcConnected(connected);
+  };
+
+  const editProfile = async () => {
+    try {
+      await fetchWithAuth("/profile", { method:"DELETE" });
+    } catch(e) {
+      console.error(e);
+    }
+    setProfileExists(false);      // 지워졌으므로
+    setOpenProfileDlg(true);      // 다시 입력 다이얼로그 띄움
   };
 
   // ───────── Google Calendar 연결 / 해제 ─────────
@@ -334,6 +349,9 @@ export default function ChatLayout() {
               {gcConnected ? "Google 연결 해제" : "Google 연결"}
             </Button>
             <Typography sx={{mr:2}}>{userName}</Typography>
+            {profileExists && (
+              <Button variant="outlined" sx={{mr:2}} onClick={editProfile}>프로필 편집</Button>
+            )}
             <Button onClick={()=>{localStorage.removeItem("token");navigate("/login");}}>
               Logout
             </Button>
@@ -467,6 +485,10 @@ export default function ChatLayout() {
       <ProfilingDialog
         open={openProfileDlg}
         onClose={()=>setOpenProfileDlg(false)}
+        onSaved={()=>{
+          setProfileExists(true);
+          setOpenProfileDlg(false);
+        }}
       />
     </Box>
   );

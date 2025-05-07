@@ -13,6 +13,9 @@ import models
 from models import Message, MessageRecommendationMap, RecCard
 from .auth import get_current_user_token  # JWT 인증 함수
 from .gcal  import build_gcal_service                  # Google service 헬퍼
+from utils.personalization import recent_feedback_summaries, make_persona_prompt
+
+HISTORY_CUTOFF = 12
 
 # 1) 로컬 타임존 결정
 try:
@@ -109,11 +112,23 @@ def chat(
         f"‘내일’(tomorrow)은 {tomorrow_str} 이므로 일정 계산 시 이 사실을 준수하세요.\n"
     )
 
+    # ▒ Personalization Block ▒
+    profile = db.query(models.UserProfile).filter_by(user_id=me.id).first()
+    persona = {
+        "locale": profile.locale if profile else "ko",
+        "genres": {g.genre: g.score for g in me.pref_genres},
+        "tags":   [{"type": t.tag_type, "tag": t.tag, "weight": t.weight}
+                   for t in me.pref_tags],
+        "recent_feedback": recent_feedback_summaries(db, me, limit=50)
+    }
+    persona_prompt = make_persona_prompt(persona)
     messages_ctx = [
+        {"role": "system", "content": persona_prompt},
         {"role": "system", "content": system_content}
     ]
     # 이전 대화(Conversation.messages) 쌓기
-    for m in convo.messages:
+    history = convo.messages[-HISTORY_CUTOFF:]
+    for m in history:
         messages_ctx.append({"role": m.role, "content": m.content})
 
     # 현재 user 질문 추가
@@ -148,7 +163,8 @@ def chat(
         },
         {
             "name":"fetch_recommendations",
-            "description": "특정 타입(복수 가능)의 추천 카드를 가져온다",
+            "description":"사용자에게 구체적 영화/콘텐츠 목록을 '추천'할 때 호출하세요. "
+                 "특히 질문이 '추천'·'볼만한'·'최고의 영화'·'best movie' 등을 포함하면 호출합니다.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -170,7 +186,7 @@ def chat(
         model       = "gpt-3.5-turbo-1106",
         messages    = messages_ctx,
         functions   = functions,
-        temperature = 0.3
+        temperature = 0.7
     )
 
     choice   = gpt.choices[0]

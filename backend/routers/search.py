@@ -1,6 +1,7 @@
 # backend/routers/search.py
 
 import os
+import json
 import requests
 import openai
 from typing import List
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal
 from .auth import get_current_user_token  # JWT 인증 함수
+from utils.personalization import recent_feedback_summaries, make_persona_prompt
 import models
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -158,6 +160,22 @@ def search_and_summarize(
         {"role": "system", "content": "You are a helpful assistant. Please read the search results and provide an organized explanation (in Korean)."},
         {"role": "user", "content": content_for_gpt}
     ]
+
+    # ▒▒▒▒▒▒▒▒▒▒▒▒▒ ▒ Personalization Block ▒ ▒▒▒▒▒▒▒▒▒▒▒▒▒
+    # ① 유저 프로필 & 피드백 취합 → JSON
+    profile_row = db.query(models.UserProfile).filter_by(user_id=current_user.id).first()
+    persona = {
+        "locale": profile_row.locale if profile_row else "ko",
+        "genres": {g.genre: g.score for g in current_user.pref_genres},
+        "tags":   [{"type": t.tag_type, "tag": t.tag, "weight": t.weight}
+                   for t in current_user.pref_tags],
+        "recent_feedback": recent_feedback_summaries(db, current_user, 50)
+    }
+    messages.insert(0, {
+        "role": "system",
+        "content": make_persona_prompt(persona)
+    })
+    print(messages)
 
     try:
         openai_resp = openai.ChatCompletion.create(

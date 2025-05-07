@@ -8,14 +8,15 @@ import { fetchWithAuth } from "../utils/api";
 
 interface Props {
   open: boolean;
-  onClose: () => void;       // 저장‧건너뛰기 이후 호출
+  onClose: () => void;       // 단순 닫기(‘나중에 할게요’)
+  onSaved: () => void;       // 새 프로필 저장 완료
 }
 
 const GENRES = ["액션","코미디","로맨스","스릴러","SF","애니메이션"];
 const LEARNINGS = ["백엔드","프론트엔드","AI","마케팅","디자인"];
 const CONTENT_TYPES = ["블로그","유튜브","팟캐스트"];
 
-export default function ProfilingDialog({ open, onClose }: Props) {
+export default function ProfilingDialog({ open, onClose, onSaved }: Props) {
   const [active, setActive] = useState(0);
   const [loading, setLoading] = useState(false);
 
@@ -48,7 +49,7 @@ export default function ProfilingDialog({ open, onClose }: Props) {
       /* 409 등 이미 존재하는 경우 → PATCH 로 대체하거나 무시 */
     }
     setLoading(false);
-    onClose();
+    onSaved();
   };
 
   /* ───────── 화면별 UI ───────── */

@@ -12,6 +12,8 @@ import openai
 import datetime as dt
 from zoneinfo import ZoneInfo
 from .search import google_search_cse
+from utils.personalization import recent_feedback_summaries
+from utils.cse_slim import slim_cse_item
 
 openai.api_key = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_HERE")
 
@@ -123,42 +125,103 @@ def search_tmdb_and_create_cards(
         db.add(new_card)
     db.commit()
 
-def filter_recent_movies_with_llm(items: list[dict], user_query: str = "") -> list[dict]:
-    """
-    GPT에게 items[]를 주고,
-    "최근 (한 달 이내) 개봉/개봉 예정인 영화"만 남기고 나머지는 제외하게 한다.
+def filter_recent_content_with_llm(
+        items: list[dict],
+        user_query: str | None = None,
+        content_type: str = "general",  # 'movie', 'news', 'learn', 'content' 등
+        recency_days: int = 30  # 기본 30일, 조정 가능
+) -> list[dict]:
+    # 현재 날짜
+    current_date = dt.datetime.now().strftime("%Y-%m-%d")
+    
+    # 컨텐츠 타입에 따른 특화 지침
+    type_specific_instructions = {
+        "movie": "영화 정보만 필터링하고, 개봉일, 감독, 배우 정보에 주목하세요.",
+        "learn": "학습 자료, 튜토리얼, 강의 등 교육 관련 컨텐츠를 필터링하세요.",
+        "content": "뉴스 기사, 블로그 포스트 등 일반 컨텐츠를 필터링하세요.",
+        "general": "모든 종류의 컨텐츠를 필터링하되, 사용자 쿼리와의 관련성을 중점적으로 판단하세요."
+    }
+    
+    # 1) 컨텐츠 타입과 사용자 쿼리에 맞는 프롬프트 구성
+    system_prompt = (
+        "You are a content filtering API that selects the most relevant and recent items.\n\n"
+        f"Today's date: {current_date}\n\n"
+        f"Content type: {content_type}\n"
+        f"User query: \"{user_query or '(not specified)'}\"\n\n"
+        "Task: From the provided search results, filter and keep only items that:\n"
+        f"1. Were published within the last {recency_days} days\n"
+        "2. Are highly relevant to the user's query\n"
+        f"3. {type_specific_instructions.get(content_type, type_specific_instructions['general'])}\n\n"
+        "For each item, carefully analyze:\n"
+        "- Publication date (if available)\n"
+        "- Title and snippet relevance to query\n"
+        "- Quality and usefulness of the content\n"
+        "- Source credibility (if determinable)\n\n"
+        "Respond with valid JSON object:\n"
+        '{"keep": [indices of items to keep], "confidence": [0-1 score for each kept item]}\n'
+    )
 
-    여기서 user_query를 시스템 프롬프트에 삽입해,
-    "사용자가 실제로 원한 내용"을 LLM이 파악할 수 있게 함.
-    """
+    # 2) 페이로드 처리 - 날짜 정보 강화
+    enhanced_items = []
+    for idx, item in enumerate(items):
+        snippet = item.get("snippet", "")[:200]  # 적절한 길이로 제한
+        
+        # 메타데이터 처리
+        enhanced_item = {
+            "idx": idx,
+            "title": item.get("title", ""),
+            "snippet": snippet,
+            "link": item.get("link", ""),
+            "raw_date": extract_date_from_metadata(item)  # 메타데이터에서 날짜 추출
+        }
+        enhanced_items.append(enhanced_item)
 
-    system_prompt = f"""
-        The user asked: '{user_query}'.
-
-        We have these search results about movies. 
-        If none mention an explicit release date, do your best guess. 
-        Never return an empty array. 
-        At least pick something that might be relevant to recently released or recommended movies. 
-        Output in valid JSON array.
-        """
-    user_msg = { "results": items }
-    print(system_prompt)
-
+    # 3) LLM 호출 - 모델 선택은 중요도/비용에 따라 조정
     try:
-        completion = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            temperature=0.0,
+        rsp = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo-1106",  # 필요에 따라 모델 선택
+            temperature=0,
+            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": json.dumps(user_msg)}
-            ]
+                {"role": "user", "content": json.dumps(
+                    {"query": user_query, "content_type": content_type, "results": enhanced_items},
+                    ensure_ascii=False
+                )}
+            ],
+            max_tokens=512  # 응답 크기 확대
         )
-        filtered_json = completion.choices[0].message["content"]
-        # 예: '[{"title":"...","snippet":"...","link":"..."}, ...]'
-        final_list = json.loads(filtered_json)
-        return final_list
-    except:
-        return []
+
+        # 4) 결과 파싱 및 신뢰도 처리
+        raw = json.loads(rsp.choices[0].message.content)
+        keep_idx = raw.get("keep", [])
+        confidence_scores = raw.get("confidence", [1.0] * len(keep_idx))  # 기본값은 1.0
+        
+        # 신뢰도 점수가 0.6 이상인 항목만 유지 (선택적)
+        filtered_items = []
+        for i, idx in enumerate(keep_idx):
+            if idx >= 0 and idx < len(items) and (i >= len(confidence_scores) or confidence_scores[i] >= 0.6):
+                filtered_items.append(items[idx])
+        
+        return filtered_items
+    
+    except Exception as e:
+        print(f"LLM filtering error: {e}")
+        # 오류 발생 시 원본 아이템 최대 5개만 반환 (안전 조치)
+        return items[:5]
+
+# 헬퍼 함수: 메타데이터에서 날짜 추출
+def extract_date_from_metadata(item):
+    # 날짜 정보가 있는 다양한 필드 확인
+    for field in ["publishedDate", "date", "pubDate", "publishTime", "created"]:
+        if field in item and item[field]:
+            return item[field]
+    
+    # 스니펫이나 제목에서 날짜 패턴 찾기
+    text = item.get("title", "") + " " + item.get("snippet", "")
+    # 여기에 정규식 또는 날짜 추출 로직 구현
+    
+    return None
 
 def search_cse_and_create_cards(
     db: Session,
@@ -187,11 +250,17 @@ def search_cse_and_create_cards(
     if not items:
         return
 
+    # --- NEW ----------------------------------------------------
+    # LLM에 넘길 때는 ‘다이어트’된 item만 사용
+    slimmed = [slim_cse_item(it) for it in items]
+    # token 폭발을 막기 위해 snippet 길이가 큰 뉴스류면 150자로 더 자르는 것도 OK
+    # ------------------------------------------------------------
+
     # 2) LLM 필터
-    chunks = [items[i:i+10] for i in range(0, len(items), 10)]
+    chunks = [slimmed[i:i+8] for i in range(0, len(slimmed), 8)]  # 8개씩만
     final_items = []
     for chunk in chunks:
-        partial_filtered = filter_recent_movies_with_llm(chunk, user_query=user_query)
+        partial_filtered = filter_recent_content_with_llm(chunk, user_query=user_query, content_type=rec_type)
         final_items.extend(partial_filtered)
     print(final_items)
     if not final_items:
@@ -293,11 +362,29 @@ def get_recommendations(
     if not candidates:
         return []
 
-    # 중복 title 제거
+    # ==== 1) 개인화 스코어 계산 ========================================
+    fb = recent_feedback_summaries(db, current_user, 50)
+    like_ids    = {x["id"] for x in fb["likes"]}
+    dislike_ids = {x["id"] for x in fb["dislikes"]}
+
+    tag_weights = { t.tag: t.weight for t in current_user.pref_tags }
+
+    def score(card:models.RecCard)->float:
+        # 기본 = 최신일수록 +0.01 (timestamp)
+        s = card.created_at.timestamp()*1e-13               # 0~1 범위 조정
+        # 장르 점수
+        for g in card.tags:
+            s += tag_weights.get(g,0)*0.5
+        # 피드백 반영
+        if card.id   in like_ids:    s += 3
+        if card.id   in dislike_ids: s -= 3
+        return s
+
+    # ==== 2) 스코어로 소트 후 중복제거 =================================
     result = []
     seen_titles = set()
     count = 0
-    for c in candidates:
+    for c in sorted(candidates, key=score, reverse=True):
         if c.title not in seen_titles:
             # feedback_logs 찾아본다
             fb = db.query(models.FeedbackLog).filter_by(
