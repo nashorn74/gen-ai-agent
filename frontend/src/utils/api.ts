@@ -23,9 +23,28 @@ export async function fetchWithAuth<T = any>(
     headers,
   });
 
-  // 성공 분기
-  if (res.ok) return raw ? (await (opts.raw ? res : res.json())) as T
-                         : (await res.json()) as T;
+  /* ---------- 성공 ---------- */
+  if (res.ok) {
+    return raw ? (await (opts.raw ? res : res.json())) as T
+               : (await res.json()) as T;
+  }
+
+  /* ---------- 401 처리 ---------- */
+  if (res.status === 401) {
+    // ① 클라이언트 측 인증 상태 초기화
+    localStorage.removeItem("token");
+
+    // ② 로그인 화면으로 이동 (SPA ↔ 직접 새로고침 모두 OK)
+    if (window.location.pathname !== "/login") {
+      window.location.replace("/login");
+    }
+
+    // 이후 로직은 굳이 실행할 필요 없지만,
+    // 호출 쪽에서 try/catch 로 흐름을 맞출 수 있게 Error 는 던져 둡니다.
+    const err401 = new Error("Unauthorized") as Error & { status: number };
+    err401.status = 401;
+    throw err401;
+  }
 
   /* ---------- 에러 처리 ---------- */
   let detail: any = {};

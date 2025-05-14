@@ -1,23 +1,34 @@
-import { useEffect, useState, ChangeEvent } from "react";
+// src/pages/ChatLayout.tsx
+import {
+  useEffect, useState, useRef, useCallback, ChangeEvent, useLayoutEffect
+} from "react";
 import { useNavigate } from "react-router-dom";
 import dayjs from "dayjs";
 import {
   Box, Drawer, Toolbar, List, ListItemButton, ListItemText, Divider,
-  AppBar, Typography, Button, Paper, TextField, Switch, FormControlLabel,
+  AppBar, Typography, Button, TextField, Switch, FormControlLabel,
   ListSubheader, Dialog, DialogTitle, DialogContent, DialogActions,
-  LinearProgress, IconButton
+  LinearProgress, IconButton, Paper, useTheme,
 } from "@mui/material";
 import { ThumbUp, ThumbDown } from "@mui/icons-material";
+import ToggleButton from "@mui/material/ToggleButton";
+import ToggleButtonGroup from "@mui/material/ToggleButtonGroup";
+import ChatOutlinedIcon from "@mui/icons-material/ChatOutlined";
+import ArticleOutlinedIcon from "@mui/icons-material/ArticleOutlined";
+import { VariableSizeList, ListChildComponentProps } from "react-window";
+import useResizeObserver from "../hooks/useResizeObserver";
+import AutoSizer from "react-virtualized-auto-sizer";
+import type { Size } from "react-virtualized-auto-sizer";
 import { fetchWithAuth } from "../utils/api";
 import ProfilingDialog from "../components/ProfilingDialog";
 
+/* ---------- types ---------- */
 interface FeedbackInfo {
   feedback_id?: number;
   feedback_score?: number;
   feedback_label?: string;
   details?: any;
 }
-
 interface RecommendCard {
   card_id: string;
   type: string;
@@ -42,15 +53,18 @@ interface AgendaEvent {
   start: { dateTime?: string; date?: string };
 }
 
+/* =================================================================== */
 export default function ChatLayout() {
   const navigate = useNavigate();
+  const theme = useTheme();
 
-  // ───────── 상태 ─────────
+  /* ---------- state ---------- */
   const [userName, setUserName]           = useState("");
   const [profileExists, setProfileExists] = useState(false);
   const [conversations, setConversations] = useState<any[]>([]);
   const [selectedConversation, setSelectedConversation] = useState<number|null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [inputMode, setInputMode] = useState<"chat" | "summary">("chat");
 
   const [question,    setQuestion]    = useState("");
   const [searchMode,  setSearchMode]  = useState(false);
@@ -60,259 +74,272 @@ export default function ChatLayout() {
   const [agenda,      setAgenda]      = useState<AgendaEvent[]>([]);
   const [gcConnected, setGcConnected] = useState(false);
 
-  // ─── 빠른 일정 Dialog ───
+  /* ----- quick-event dialog ----- */
   const [openQuick,   setOpenQuick]   = useState(false);
   const [quickTitle,  setQuickTitle]  = useState("");
   const [quickDate,   setQuickDate]   = useState(dayjs().format("YYYY-MM-DD"));
 
   const [openProfileDlg, setOpenProfileDlg] = useState(false);
 
-  // ───────── 최초 로딩 ─────────
+  /* ---------- virtualization refs ---------- */
+  const listRef = useRef<VariableSizeList>(null);
+  const sizeMap = useRef<{ [k:number]:number }>({});
+  const getSize = (idx:number)=> sizeMap.current[idx] ?? 120;     // fallback height
+  const setSize = (idx:number,h:number)=>{
+    if (sizeMap.current[idx] !== h) {
+      sizeMap.current = { ...sizeMap.current, [idx]: h };
+      listRef.current?.resetAfterIndex(idx);
+    }
+  };
+
+  /* =================================================================== */
+  /*   1. 첫 로딩   */
   useEffect(() => {
     const token = localStorage.getItem("token");
     if (!token) { navigate("/login"); return; }
 
-    // 프로필 존재 여부 확인
+    /* 프로필 */
     fetchWithAuth("/profile")
-    .then(()=> setProfileExists(true))
-    .catch(err => {
-      // utils/api → fetchWithAuth 가 404 일 때 err.status 반환하도록 가정
-      if (err.status===404) {
-        setProfileExists(false);
-        setOpenProfileDlg(true);
-      }
-    });
+      .then(()=> setProfileExists(true))
+      .catch(err=>{
+        if (err.status===404) { setProfileExists(false); setOpenProfileDlg(true); }
+      });
 
-    // 사용자 정보
-    fetchWithAuth("/auth/me").then(d => setUserName(d.username));
-
-    // 대화 목록
+    /* 사용자 · 대화 목록 · 일정 3일 */
+    fetchWithAuth("/auth/me").then(d=> setUserName(d.username));
     fetchWithAuth("/chat/conversations").then(setConversations);
 
-    // 3일치 일정
-    const end = new Date(Date.now() + 3*86400*1000).toISOString();
+    const end = new Date(Date.now()+3*86400e3).toISOString();
     fetchWithAuth(`/events?end=${end}`).then(setAgenda);
 
-    // Google 연결 여부
-    fetchWithAuth("/gcal/status").then(d => setGcConnected(d.connected));
+    /* GCal 연결 여부 */
+    fetchWithAuth("/gcal/status").then(d=> setGcConnected(d.connected));
   }, []);
 
-  // ─── 대화 선택 → 메시지 불러오기 ───
+  /*   2. 대화 선택 → 메시지 로딩   */
   useEffect(() => {
-    if (!selectedConversation) {
-      setMessages([]);
-      return;
-    }
+    if (!selectedConversation) { setMessages([]); return; }
     loadConversation(selectedConversation);
   }, [selectedConversation]);
 
-  // ───────── Helper: 대화/목록 로더 ─────────
-  const loadConversation = async (convId:number) => {
-    const d = await fetchWithAuth(`/chat/conversations/${convId}`);
-    setMessages(d.messages);
-  };
-  const loadConversationList = async () => {
-    const list = await fetchWithAuth("/chat/conversations");
-    setConversations(list);
-  };
+  useEffect(() => {
+    if (!messages.length || !listRef.current) return;
+    // 마지막 행으로 스크롤 – 'end' 는 살짝 여유를 둬 깔끔
+    listRef.current.scrollToItem(messages.length - 1, "end");
+  }, [messages.length]);   // ← 메시지 개수 변할 때마다 실행
 
-  // ─── Drawer Helper ───
-  const reloadAgenda = async () => {
-    const end = new Date(Date.now() + 3*86400*1000).toISOString();
+  /* ---------- helpers ---------- */
+  const loadConversation = async (cid:number)=>{
+    const d = await fetchWithAuth(`/chat/conversations/${cid}`);
+    const sorted = [...d.messages].sort(
+      (a,b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+    );
+    setMessages(sorted);
+    sizeMap.current = {};
+    listRef.current?.resetAfterIndex(0);
+  };
+  const loadConversationList = async ()=>{
+    setConversations(await fetchWithAuth("/chat/conversations"));
+  };
+  const reloadAgenda = async ()=>{
+    const end = new Date(Date.now()+3*86400e3).toISOString();
     setAgenda(await fetchWithAuth(`/events?end=${end}`));
   };
-
-  const refreshGcalStatus = async () => {
+  const refreshGcalStatus = async ()=>{
     const { connected } = await fetchWithAuth("/gcal/status");
     setGcConnected(connected);
   };
 
-  const editProfile = async () => {
-    try {
-      await fetchWithAuth("/profile", { method:"DELETE" });
-    } catch(e) {
-      console.error(e);
-    }
-    setProfileExists(false);      // 지워졌으므로
-    setOpenProfileDlg(true);      // 다시 입력 다이얼로그 띄움
-  };
-
-  // ───────── Google Calendar 연결 / 해제 ─────────
-  const toggleGoogle = async () => {
+  /* ---------- Google Calendar 연결/해제 ---------- */
+  const toggleGoogle = async ()=>{
     if (!gcConnected) {
       const { auth_url } = await fetchWithAuth("/gcal/authorize");
-      const popup = window.open(auth_url, "_blank", "width=500,height=650");
-      const handler = (e: MessageEvent) => {
-        if (e.data === "gcal_success") {
-          popup?.close();
-          window.removeEventListener("message", handler);
-          refreshGcalStatus();
-          reloadAgenda();
-        }
+      const popup = window.open(auth_url,"_blank","width=500,height=650");
+      const handler = (e:MessageEvent)=>{
+        if(e.data==="gcal_success"){ popup?.close(); window.removeEventListener("message",handler); refreshGcalStatus(); reloadAgenda(); }
       };
-      window.addEventListener("message", handler);
+      window.addEventListener("message",handler);
     } else {
-      setGcConnected(false);
-      setAgenda([]);
-      
-      await fetchWithAuth("/gcal/disconnect", { method: "DELETE" });
-      refreshGcalStatus();      
+      setGcConnected(false); setAgenda([]);
+      await fetchWithAuth("/gcal/disconnect",{method:"DELETE"}); refreshGcalStatus();
     }
   };
 
-  const quickSave = async () => {
-    if (!quickTitle) return;           // 제목이 없으면 무시
-    setIsLoading(true);
-  
-    const token = localStorage.getItem("token")!;
-    const start = dayjs(quickDate).hour(9).minute(0).second(0);
-    const end   = start.add(1, "hour");
-  
-    await fetch("http://localhost:8000/events", {
-      method : "POST",
-      headers: {
-        "Content-Type" : "application/json",
-        Authorization  : `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        summary : quickTitle,
-        start   : start.toISOString(),
-        end     : end  .toISOString(),
-        timezone: "Europe/Berlin",
-      }),
-    });
-  
-    // 새 일정이 저장됐으니 3‑일 미리보기 다시 읽기
-    const until = new Date(Date.now() + 3*24*60*60*1000).toISOString();
-    const mini  = await fetchWithAuth(`/events?end=${until}`);
-    setAgenda(mini);
-  
-    setQuickTitle("");
-    setOpenQuick(false);
-    setIsLoading(false);
-  };
-
-  // ─── 새 대화 ───
-  const newConversation = () => {
+  /* ---------- 새로운 대화 ---------- */
+  const newConversation = ()=>{
     setSelectedConversation(null);
     setMessages([]);
+    sizeMap.current = {};
   };
 
-  // ─── 채팅 / 검색 요청 ───
-  const send = async () => {
-    if (!question.trim()) return;
-
+  /* =================================================================== */
+  /*   3. send() – 기존 REST 흐름 유지   */
+  const send = async ()=>{
+    if (!question.trim() || isLoading) return;
     setIsLoading(true);
-    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone; // ex. "Europe/Berlin"
+
     const endpoint = searchMode ? "/search" : "/chat";
-    const payload: any = {
-      conversation_id : selectedConversation,
-      question        : question,
-      timezone        : tz,
+    const payload  = {
+      conversation_id: selectedConversation,
+      question,
+      query: question,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     };
 
-    const data = await fetchWithAuth(endpoint, { method:"POST", body:JSON.stringify(payload)});
-    if (data.conversation_id) {
-      // 1) 해당 대화를 선택 (title 등 변동 가능)
-      setSelectedConversation(data.conversation_id);
+    try{
+      const data = await fetchWithAuth(endpoint,{ method:"POST", body:JSON.stringify(payload) });
 
-      // 2) 메시지 목록(대화 상세) 다시 로딩
-      await loadConversation(data.conversation_id);
-
-      // 3) 대화 목록(제목 혹은 정렬이 바뀌었을 수 있으니) 다시 로딩
-      await loadConversationList();
-
-      // 4) 일정도 다시 불러오기 (3일치)
-      await reloadAgenda();
+      /* 대화 · 메시지 · 일정 다시 읽기 */
+      if (data.conversation_id) {
+        setSelectedConversation(data.conversation_id);
+        await loadConversation(data.conversation_id);
+        await loadConversationList();
+        await reloadAgenda();
+      }
+    } finally {
+      setIsLoading(false);
+      setQuestion("");
     }
-
-    setQuestion("");
-    setIsLoading(false);
   };
 
-  // ─── 파일 요약 ───
-  const summarize = async () => {
-    if (!uploadFile) return;
+  /* ---------- 파일 요약 ---------- */
+  const summarize = async ()=>{
+    if(!uploadFile) return;
     setIsLoading(true);
+
     const fd = new FormData();
-    fd.append("file", uploadFile);
-    if (selectedConversation) fd.append("conversation_id", String(selectedConversation));
-    const data = await fetchWithAuth("/summarize", { method:"POST", body:fd, raw:true });
-    if (data.conversation_id) setSelectedConversation(data.conversation_id);
+    fd.append("file",uploadFile);
+    if(selectedConversation) fd.append("conversation_id",String(selectedConversation));
+
+    const data = await fetchWithAuth("/summarize",{method:"POST",body:fd});
+    if(data.conversation_id) setSelectedConversation(data.conversation_id);
+
+    let summaryText: string;
+
+    if (typeof data.summary === "string" && data.summary.startsWith('"')) {
+      // 따옴표로 둘러싸인 형태면 JSON.parse 시도
+      try {
+        summaryText = JSON.parse(data.summary)
+                          .replace(/\\n/g, "\n")      // \n → 줄바꿈
+                          .replace(/\\"/g, "\"");      // \" → "
+      } catch {
+        summaryText = data.summary;                   // 실패하면 원본 유지
+      }
+    } else {
+      summaryText = String(data.summary);
+    }
 
     const now = Date.now();
-    setMessages(p => [
+    setMessages(p=>[
       ...p,
-      {message_id:now,   role:"user",      content:`[파일요약] ${uploadFile.name}`, created_at:new Date().toISOString()},
-      {message_id:now+1, role:"assistant", content:data.summary,                    created_at:new Date().toISOString()}
+      {message_id:now,role:"user",content:`[파일요약] ${uploadFile.name}`,created_at:new Date().toISOString()},
+      {message_id:now+1,role:"assistant",content:summaryText,created_at:new Date().toISOString()},
     ]);
     setUploadFile(null);
     setIsLoading(false);
   };
 
-  // ★ 추가: 카드 피드백 전송 함수
-  const sendCardFeedback = async (card_id:string, label:string) => {
-    // POST /feedback (category="recommend", reference_id=`card_id=${card_id}`, feedback_label=label)
-    const body = {
-      category: "recommend",
-      reference_id: `card_id=${card_id}`,
-      feedback_label: label
-    };
-    try {
-      await fetchWithAuth("/feedback", {
-        method: "POST",
-        body: JSON.stringify(body)
+  /* ---------- 피드백 ---------- */
+  const sendCardFeedback = async (card_id:string,label:string)=>{
+    await fetchWithAuth("/feedback",{method:"POST",body:JSON.stringify({
+      category:"recommend",reference_id:`card_id=${card_id}`,feedback_label:label
+    })});
+    if(selectedConversation) loadConversation(selectedConversation);
+  };
+  const sendMessageFeedback = async (mid:number,label:string)=>{
+    await fetchWithAuth("/feedback",{method:"POST",body:JSON.stringify({
+      category:"chat",reference_id:`message_${mid}`,feedback_label:label
+    })});
+    if(selectedConversation) loadConversation(selectedConversation);
+  };
+  const iconColor = (current:string|undefined,target:string)=>(
+    current===target ? (target==="like"?"success":"error") : "default"
+  );
+
+  /* =================================================================== */
+  /*   4. react-window Row renderer   */
+  const Row = useCallback(
+    ({ index, style }: ListChildComponentProps) => {
+      const m = messages[index];
+      const isAssistant = m.role === "assistant";
+  
+      const rowStyle: React.CSSProperties = { ...style, width: "100%" };
+      const measuredRef = useResizeObserver(rect => {
+        const h = rect.height + 8;
+        if (sizeMap.current[index] !== h) {
+          sizeMap.current = { ...sizeMap.current, [index]: h };
+          listRef.current?.resetAfterIndex(index);
+
+          if (index === messages.length - 1) {
+            listRef.current?.scrollToItem(index, "end");
+          }
+        }
       });
-      // TODO: 업데이트된 피드백을 반영하기 위해, 대화 다시 로드 or 해당 메시지만 업데이트
-      if (selectedConversation) {
-        const data = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
-        setMessages(data.messages);
-      }
-    } catch(e) {
-      console.error(e);
-    }
-  };
+  
+      return (
+        <div style={rowStyle}>
+          <Box ref={measuredRef} sx={{ px:1, py:0.5 }}>
+            <Typography variant="subtitle2" color="text.secondary">
+              {m.role}:
+            </Typography>
 
-  // 메시지 피드백
-  const sendMessageFeedback = async (message_id:number, label:string) => {
-    // POST /feedback (category="chat", reference_id=`message_${message_id}`, feedback_label=label)
-    const body = {
-      category: "chat",
-      reference_id: `message_${message_id}`,
-      feedback_label: label
-    };
-    try {
-      await fetchWithAuth("/feedback", {
-        method: "POST",
-        body: JSON.stringify(body)
-      });
-      if (selectedConversation) {
-        const data = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
-        setMessages(data.messages);
-      }
-    } catch(e) {
-      console.error(e);
-    }
-  };
+          {m.cards?.length ? (
+            <Box sx={{ mt:1, pl:2, borderLeft:`4px solid ${theme.palette.divider}` }}>
+              {m.cards.map(card=>(
+                <Box key={card.card_id} sx={{ mb:1 }}>
+                  <Typography variant="subtitle1" fontWeight="bold">{card.title}</Typography>
+                  {card.subtitle && <Typography variant="body2" color="text.secondary">{card.subtitle}</Typography>}
+                  {card.link && (
+                    <Button size="small" variant="outlined" onClick={()=>window.open(card.link,"_blank")}>자세히</Button>
+                  )}
+                  {card.reason && (
+                    <Typography variant="caption" sx={{ display:"block", mt:0.5 }}>사유: {card.reason}</Typography>
+                  )}
+                  <Box sx={{ display:"flex", gap:0.5, mt:0.5 }}>
+                    <IconButton
+                      size="small"
+                      color={iconColor(card.feedback?.feedback_label,"like")}
+                      onClick={()=>sendCardFeedback(card.card_id,"like")}
+                    ><ThumbUp fontSize="inherit" /></IconButton>
+                    <IconButton
+                      size="small"
+                      color={iconColor(card.feedback?.feedback_label,"dislike")}
+                      onClick={()=>sendCardFeedback(card.card_id,"dislike")}
+                    ><ThumbDown fontSize="inherit" /></IconButton>
+                  </Box>
+                </Box>
+              ))}
+            </Box>
+          ) : (
+            <Typography
+              whiteSpace="pre-line"
+              sx={{ wordBreak:"break-word" }}
+            >
+              {m.content}
+            </Typography>
+          )}
 
-  // ---- 아이콘 색상 구분 함수 (★추가)
-  const iconColor = (currentLabel: string|undefined, targetLabel:string) => {
-    if (currentLabel === targetLabel) {
-      // 좋아요 선택 => 녹색, 싫어요 선택 => 빨간색
-      return (targetLabel==="like") ? "success" : "error";
-    }
-    return "default";
-  };
+          {isAssistant && (
+            <Box sx={{ display:"flex", gap:0.5, mt:1 }}>
+              <IconButton size="small" color={iconColor(m.feedback?.feedback_label,"like")}   onClick={()=>sendMessageFeedback(m.message_id,"like")}  ><ThumbUp   fontSize="inherit"/></IconButton>
+              <IconButton size="small" color={iconColor(m.feedback?.feedback_label,"dislike")}onClick={()=>sendMessageFeedback(m.message_id,"dislike")}><ThumbDown fontSize="inherit"/></IconButton>
+            </Box>
+          )}
+        </Box>
+      </div>
+    );
+  },[messages]);
 
-  // ───────── 렌더링 ─────────
+  /* =================================================================== */
+  /*   5. render   */
   return (
-    <Box sx={{ display:"flex", height:"100vh", overflow:"hidden" }}>
-      {/* ─── Drawer ─── */}
-      <Drawer variant="permanent" sx={{width:240,
-        [`& .MuiDrawer-paper`]:{width:240, top:64, boxSizing:"border-box"}}}>
+    <Box sx={{ display:"flex", height:"100%", overflow:"hidden" }}>
+      {/* ---------------- Drawer ---------------- */}
+      <Drawer variant="permanent" sx={{ width:240,
+        [`& .MuiDrawer-paper`]:{ width:240, top:64, boxSizing:"border-box" } }}>
         <Toolbar />
         <List>
-          <ListItemButton sx={{bgcolor:"#f5f5f5"}} onClick={newConversation}>
+          <ListItemButton sx={{ bgcolor:"action.hover" }} onClick={newConversation}>
             <ListItemText primary="새로운 대화 시작"/>
           </ListItemButton>
           <Divider />
@@ -320,7 +347,7 @@ export default function ChatLayout() {
             <ListItemButton key={c.conversation_id}
               selected={c.conversation_id===selectedConversation}
               onClick={()=>setSelectedConversation(c.conversation_id)}>
-              <ListItemText primary={c.title||`Conv ${c.conversation_id}`} />
+              <ListItemText primary={c.title||`Conv ${c.conversation_id}`}/>
             </ListItemButton>
           ))}
         </List>
@@ -334,161 +361,194 @@ export default function ChatLayout() {
               />
             </ListItemButton>
           ))}
-          {agenda.length===0 && (
-            <ListItemText sx={{p:2}} secondary="예정된 일정 없음"/>
-          )}
+          {!agenda.length && <ListItemText sx={{ p:2 }} secondary="예정된 일정 없음"/>}
+
+          {/* ─── 새로 추가된 “빠른 일정” 버튼 ─── */}
+          <ListItemButton
+            sx={{ mt:1, bgcolor:"action.hover" }}
+            onClick={()=>setOpenQuick(true)}
+          >
+            <ListItemText primary="＋ 빠른 일정" />
+          </ListItemButton>
         </List>
       </Drawer>
 
-      {/* ─── Main ─── */}
-      <Box sx={{ flex:1, display:"flex", flexDirection:"column", minWidth:0 }}>
+      {/* ---------------- Main ---------------- */}
+      <Box sx={{ flex:1, display:"flex", flexDirection:"column", minWidth:0, 
+        minHeight: 0, p:2, gap: 1
+       }}>
+        {/* AppBar */}
         <AppBar position="relative" color="default" sx={{ zIndex:1200 }}>
           <Toolbar>
             <Typography sx={{ flexGrow:1 }}>대화</Typography>
-            <Button variant="outlined" onClick={toggleGoogle} sx={{mr:2}}>
+            <Button variant="outlined" onClick={toggleGoogle} sx={{ mr:2 }}>
               {gcConnected ? "Google 연결 해제" : "Google 연결"}
             </Button>
-            <Typography sx={{mr:2}}>{userName}</Typography>
-            {profileExists && (
-              <Button variant="outlined" sx={{mr:2}} onClick={editProfile}>프로필 편집</Button>
-            )}
-            <Button onClick={()=>{localStorage.removeItem("token");navigate("/login");}}>
-              Logout
-            </Button>
+            <Typography sx={{ mr:2 }}>{userName}</Typography>
+            {profileExists && <Button variant="outlined" sx={{ mr:2 }} onClick={()=>{ setProfileExists(false); setOpenProfileDlg(true); }}>프로필 편집</Button>}
+            <Button onClick={()=>{ localStorage.removeItem("token"); navigate("/login"); }}>Logout</Button>
           </Toolbar>
         </AppBar>
 
         {isLoading && <LinearProgress />}
 
-        <Paper sx={{ height: '60vh', m:2, p:2, overflowY:"auto" }}>
-          {messages.length===0
-            ? <Typography color="text.secondary">대화가 없습니다.</Typography>
-            : messages.map(m=>{
-              const isAssistant = (m.role==="assistant"); // ★ user=질문은 피드백X
-              return (
-                <Box key={m.message_id} sx={{mb:1}}>
-                  <Typography variant="subtitle2" color="text.secondary">{m.role}:</Typography>
-
-                  {/* 메시지가 어시스턴트(답변)일때만 피드백 */}
-                  {isAssistant && (
-                    <Box sx={{display:"flex", gap:1, mt:1}}>
-                      <IconButton
-                        color={iconColor(m.feedback?.feedback_label,"like")}
-                        onClick={()=>sendMessageFeedback(m.message_id,"like")}
-                      >
-                        <ThumbUp fontSize="small" />
-                      </IconButton>
-                      <IconButton
-                        color={iconColor(m.feedback?.feedback_label,"dislike")}
-                        onClick={()=>sendMessageFeedback(m.message_id,"dislike")}
-                      >
-                        <ThumbDown fontSize="small" />
-                      </IconButton>
-                    </Box>
-                  )}
-
-                  {m.cards && m.cards.length>0 ? (
-                    <Box sx={{mt:1, mb:1, pl:2, borderLeft:"4px solid #ddd"}}>
-                      {m.cards.map(card=>(
-                        <Box key={card.card_id} sx={{mb:1}}>
-                          <Typography variant="subtitle1" fontWeight="bold">{card.title}</Typography>
-                          {card.subtitle && (
-                            <Typography variant="body2" color="text.secondary">
-                              {card.subtitle}
-                            </Typography>
-                          )}
-                          {card.link && (
-                            <Button size="small" variant="outlined"
-                              onClick={()=>window.open(card.link,"_blank")}>
-                              자세히
-                            </Button>
-                          )}
-                          {card.reason && (
-                            <Typography variant="caption" sx={{display:"block",mt:0.5}}>
-                              사유: {card.reason}
-                            </Typography>
-                          )}
-                          
-                          {/* ---- 카드 피드백 */}
-                          <Box sx={{display:"flex", gap:1, mt:1}}>
-                            <IconButton
-                              color={iconColor(card.feedback?.feedback_label,"like")}
-                              onClick={()=>sendCardFeedback(card.card_id, "like")}
-                            >
-                              <ThumbUp fontSize="small" />
-                            </IconButton>
-                            <IconButton
-                              color={iconColor(card.feedback?.feedback_label,"dislike")}
-                              onClick={()=>sendCardFeedback(card.card_id, "dislike")}
-                            >
-                              <ThumbDown fontSize="small" />
-                            </IconButton>
-                          </Box>
-                        </Box>
-                      ))}
-                    </Box>
-                  ) : (
-                    <Typography whiteSpace="pre-line">{m.content}</Typography>
-                  )}
-                  <Divider sx={{my:1}}/>
-                </Box>
-              );
-            })}
+        {/* 메시지 영역 */}
+        <Paper
+          sx={{
+            flex: "1 1 auto",   // column 내부에서 ‘가변(남는) 높이’ 영역
+            minHeight: 0,       // 중요: react-window 가 정확히 height 계산
+            overflow: "hidden",
+          }}
+        >
+          {messages.length===0 ? (
+            <Box sx={{ p:2 }}><Typography color="text.secondary">대화가 없습니다.</Typography></Box>
+          ) : (
+            <AutoSizer>
+              {({ height, width }: Size) => (
+                <VariableSizeList
+                  ref={listRef}
+                  height={height}
+                  width={width}
+                  itemCount={messages.length}
+                  itemSize={getSize}
+                  overscanCount={4}
+                  itemKey={(index: number) => messages[index].message_id}
+                >
+                  {Row}
+                </VariableSizeList>
+              )}
+            </AutoSizer>
+          )}
         </Paper>
 
-        {/* 입력 */}
-        <Box sx={{m:2, display:"flex", gap:1}}>
-          <FormControlLabel control={
-            <Switch checked={searchMode} onChange={e=>setSearchMode(e.target.checked)}/>
-          } label="정보검색"/>
-          <TextField fullWidth label="메시지 입력" value={question}
-            onChange={e=>setQuestion(e.target.value)}
-            onKeyDown={e=>{if(e.key==="Enter") send();}}/>
-          <Button variant="contained" onClick={send} disabled={isLoading}>Send</Button>
-        </Box>
+        {/* ────── 입력/요약 컨트롤 (1 줄) ────── */}
+        <Box
+          sx={{
+            flex: "0 0 auto",   // 고정 높이
+            display: "flex",
+            gap: 1,
+            alignItems: "center",
+          }}
+        >
 
-        {/* 파일 & 빠른 일정 */}
-        <Box sx={{m:2, display:"flex", gap:1}}>
-          <Button variant="outlined" component="label" disabled={isLoading}>
-            파일 선택
-            <input hidden type="file" accept=".pdf,.txt" onChange={(e:ChangeEvent<HTMLInputElement>)=>{
-              setUploadFile(e.target.files?.[0]||null);
-            }}/>
-          </Button>
-          <Typography variant="body2" sx={{flex:1}}>
-            {uploadFile ? uploadFile.name : "선택된 파일 없음"}
-          </Typography>
-          <Button variant="contained" disabled={!uploadFile||isLoading} onClick={summarize}>
-            문서 요약
-          </Button>
-          <Button variant="outlined" onClick={()=>setOpenQuick(true)}>빠른 일정</Button>
+        {/* 모드 아이콘 토글 */}
+        <ToggleButtonGroup
+          color="primary"
+          value={inputMode}
+          exclusive
+          onChange={(_, v) => v && setInputMode(v)}
+          size="small"
+        >
+          <ToggleButton value="chat"   sx={{ px:1 }} aria-label="채팅">
+            <ChatOutlinedIcon fontSize="small" />
+          </ToggleButton>
+          <ToggleButton value="summary" sx={{ px:1 }} aria-label="문서 요약">
+            <ArticleOutlinedIcon fontSize="small" />
+          </ToggleButton>
+        </ToggleButtonGroup>
+
+        {/* ───────── chat 모드 ───────── */}
+        {inputMode === "chat" && (
+          <>
+            <FormControlLabel
+              sx={{ mr: 1,
+                '.MuiFormControlLabel-label': {
+                  fontSize: 12,          // 더 작은 글꼴
+                  width: 32,             // 셀 너비 확보 (필요하면 36·40 으로 조절)
+                  textAlign: 'center',
+                  letterSpacing: '0.03em'
+                }
+               }}
+              control={
+                <Switch
+                  size="small"
+                  checked={searchMode}
+                  onChange={e => setSearchMode(e.target.checked)}
+                />
+              }
+              label="검색"
+            />
+
+            <TextField
+              fullWidth
+              size="small"
+              label="메시지 입력"
+              value={question}
+              onChange={e => setQuestion(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") send(); }}
+            />
+
+            <Button
+              variant="contained"
+              onClick={send}
+              disabled={isLoading || !question.trim()}
+            >
+              Send
+            </Button>
+          </>
+        )}
+
+        {/* ───────── summary 모드 ───────── */}
+        {inputMode === "summary" && (
+          <>
+            <Button
+              variant="outlined"
+              component="label"
+              size="small"
+              disabled={isLoading}
+            >
+              파일
+              <input
+                hidden
+                type="file"
+                accept=".pdf,.txt"
+                onChange={e => setUploadFile(e.target.files?.[0] || null)}
+              />
+            </Button>
+
+            <Typography
+              variant="body2"
+              sx={{
+                flex: 1,
+                maxWidth: 240,
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+            >
+              {uploadFile?.name || "선택된 파일 없음"}
+            </Typography>
+
+            <Button
+              variant="contained"
+              onClick={summarize}
+              disabled={!uploadFile || isLoading}
+            >
+              요약
+            </Button>
+          </>
+        )}
         </Box>
       </Box>
 
       {/* 빠른 일정 Dialog */}
       <Dialog open={openQuick} onClose={()=>setOpenQuick(false)}>
         <DialogTitle>빠른 일정 추가</DialogTitle>
-        <DialogContent sx={{display:"flex",flexDirection:"column",gap:2,mt:1}}>
-          <TextField label="제목" value={quickTitle}
-            onChange={e=>setQuickTitle(e.target.value)}/>
-          <TextField type="date" label="날짜" InputLabelProps={{shrink:true}}
-            value={quickDate} onChange={e=>setQuickDate(e.target.value)}/>
+        <DialogContent sx={{ display:"flex", flexDirection:"column", gap:2, mt:1 }}>
+          <TextField label="제목" value={quickTitle} onChange={e=>setQuickTitle(e.target.value)} />
+          <TextField type="date" label="날짜" InputLabelProps={{ shrink:true }} value={quickDate} onChange={e=>setQuickDate(e.target.value)} />
         </DialogContent>
         <DialogActions>
           <Button onClick={()=>setOpenQuick(false)}>취소</Button>
-          <Button onClick={quickSave} disabled={!quickTitle}>
-            저장
-          </Button>
+          <Button variant="contained" onClick={async()=>{ await quickSave(); }} disabled={!quickTitle.trim()}>저장</Button>
         </DialogActions>
       </Dialog>
 
+      {/* 프로필 입력 다이얼로그 */}
       <ProfilingDialog
         open={openProfileDlg}
         onClose={()=>setOpenProfileDlg(false)}
-        onSaved={()=>{
-          setProfileExists(true);
-          setOpenProfileDlg(false);
-        }}
+        onSaved={()=>{ setProfileExists(true); setOpenProfileDlg(false); }}
       />
     </Box>
   );
