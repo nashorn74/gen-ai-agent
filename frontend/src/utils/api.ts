@@ -2,6 +2,9 @@
  * 인증 토큰을 자동으로 실어 보내는 fetch 헬퍼
  *  - opts.raw === true → 그대로 res (Response) 또는 res.json() 반환
  */
+
+import { API_BASE } from "../lib/api";
+
 export async function fetchWithAuth<T = any>(
   url: string,
   opts: RequestInit & { raw?: boolean } = {},
@@ -17,7 +20,7 @@ export async function fetchWithAuth<T = any>(
 
   const { raw, ...fetchOpts } = opts;
 
-  const res = await fetch(`http://localhost:8000${url}`, {
+  const res = await fetch(`${API_BASE}${url}`, {
     redirect: "follow",     // 307 Redirect 도 따라가도록
     ...fetchOpts,
     headers,
