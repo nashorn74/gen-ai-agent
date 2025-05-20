@@ -10,7 +10,8 @@ import {
   ListSubheader, Dialog, DialogTitle, DialogContent, DialogActions,
   LinearProgress, IconButton, Paper, useTheme,
 } from "@mui/material";
-import { ThumbUp, ThumbDown } from "@mui/icons-material";
+import { ThumbUp, ThumbDown, Mic } from "@mui/icons-material";
+import { Edit, Delete } from "@mui/icons-material";
 import ToggleButton from "@mui/material/ToggleButton";
 import ToggleButtonGroup from "@mui/material/ToggleButtonGroup";
 import ChatOutlinedIcon from "@mui/icons-material/ChatOutlined";
@@ -70,6 +71,9 @@ export default function ChatLayout() {
   const [searchMode,  setSearchMode]  = useState(false);
   const [uploadFile,  setUploadFile]  = useState<File|null>(null);
   const [isLoading,   setIsLoading]   = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordLeft,  setRecordLeft]  = useState(5);   // ★ NEW – 남은 초
+  const recordTimer = useRef<NodeJS.Timeout|null>(null); // ★ NEW
 
   const [agenda,      setAgenda]      = useState<AgendaEvent[]>([]);
   const [gcConnected, setGcConnected] = useState(false);
@@ -80,6 +84,8 @@ export default function ChatLayout() {
   const [quickDate,   setQuickDate]   = useState(dayjs().format("YYYY-MM-DD"));
 
   const [openProfileDlg, setOpenProfileDlg] = useState(false);
+  const [editCid,   setEditCid]   = useState<number|null>(null);      // ★ NEW
+  const [editTitle, setEditTitle] = useState("");                     // ★ NEW
 
   /* ---------- virtualization refs ---------- */
   const listRef = useRef<VariableSizeList>(null);
@@ -172,6 +178,36 @@ export default function ChatLayout() {
     sizeMap.current = {};
   };
 
+  const renameConversation = async (cid: number, title: string) => {
+    await fetchWithAuth(`/chat/conversations/${cid}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title }),
+      raw: true,                 // 🔑 204(또는 body 없음) 대비
+    });
+    await loadConversationList();
+    if (selectedConversation === cid) loadConversation(cid); // 제목 즉시 반영
+  };
+  
+  const deleteConversation = async (cid: number) => {
+    if (!window.confirm("선택한 대화를 정말 삭제할까요?")) return;
+  
+    await fetchWithAuth(`/chat/conversations/${cid}`, {
+      method: "DELETE",
+      raw: true,                 // 🔑 204 대비
+    });
+  
+    // 목록 새로고침
+    await loadConversationList();
+  
+    // 방금 보고 있던 대화를 지웠다면 → 오른쪽 패널도 초기화
+    if (selectedConversation === cid) {
+      setSelectedConversation(null);
+      setMessages([]);
+      sizeMap.current = {};                 // 🔑 react-window 높이 캐시 리셋
+      listRef.current?.resetAfterIndex(0);
+    }
+  };
+
   /* =================================================================== */
   /*   3. send() – 기존 REST 흐름 유지   */
   const send = async ()=>{
@@ -199,6 +235,55 @@ export default function ChatLayout() {
     } finally {
       setIsLoading(false);
       setQuestion("");
+    }
+  };
+
+  /* ---------- 음성 녹음 + 전송 ---------- */
+  const recordAndSend = async () => {
+    if (isRecording || isLoading) return;
+  
+    /* ① 녹음 시작 --------------------------------------------------- */
+    setIsRecording(true);
+    setRecordLeft(5);
+    recordTimer.current && clearInterval(recordTimer.current);
+    recordTimer.current = setInterval(() => {
+      setRecordLeft((sec) => (sec > 1 ? sec - 1 : sec));
+    }, 1_000);
+  
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const media  = new MediaRecorder(stream, { mimeType: "audio/webm" });
+    const chunks: BlobPart[] = [];
+    media.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    media.start();
+  
+    /* ② 5초 후 자동 종료 ------------------------------------------- */
+    await new Promise<void>((res) => setTimeout(res, 5_000));
+    media.stop();
+    await new Promise<void>((res) => (media.onstop = () => res()));
+    stream.getTracks().forEach((t) => t.stop());
+  
+    /* ③ 팝업 닫기 & 타이머 해제 ------------------------------------- */
+    recordTimer.current && clearInterval(recordTimer.current);
+    setIsRecording(false);
+  
+    /* ④ 백엔드 전송(이전 코드 그대로) ------------------------------- */
+    const blob = new Blob(chunks, { type: "audio/webm" });
+    const fd   = new FormData();
+    if (selectedConversation) fd.append("conversation_id", String(selectedConversation));
+    fd.append("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone);
+    fd.append("audio", blob, "speech.webm");
+  
+    setIsLoading(true);
+    try {
+      const data = await fetchWithAuth("/speech/chat", { method: "POST", body: fd });
+      if (data.conversation_id) {
+        setSelectedConversation(data.conversation_id);
+        await loadConversation(data.conversation_id);
+        await loadConversationList();
+        await reloadAgenda();
+      }
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -346,8 +431,30 @@ export default function ChatLayout() {
           {conversations.map(c=>(
             <ListItemButton key={c.conversation_id}
               selected={c.conversation_id===selectedConversation}
-              onClick={()=>setSelectedConversation(c.conversation_id)}>
-              <ListItemText primary={c.title||`Conv ${c.conversation_id}`}/>
+              onClick={()=>setSelectedConversation(c.conversation_id)}
+              sx={{ pr:8 /* 아이콘 공간 확보 */ }}                          // ★ NEW
+            >
+              <ListItemText
+                primary={c.title||`Conv ${c.conversation_id}`}
+                primaryTypographyProps={{ noWrap:true }}
+              />
+              {/* 오른쪽 편집·삭제 아이콘 (hover 시만 불투명) */}
+              <Box
+                sx={{
+                  position:"absolute", right:8, display:"flex", gap:0.5,
+                  opacity:0.0, transition:"opacity .2s",
+                  "&:hover":{ opacity:1.0 }
+                }}
+              >
+                <IconButton
+                  size="small"
+                  onClick={(e)=>{ e.stopPropagation(); setEditCid(c.conversation_id); setEditTitle(c.title||""); }}
+                ><Edit fontSize="inherit"/></IconButton>
+                <IconButton
+                  size="small"
+                  onClick={(e)=>{ e.stopPropagation(); deleteConversation(c.conversation_id); }}
+                ><Delete fontSize="inherit"/></IconButton>
+              </Box>
             </ListItemButton>
           ))}
         </List>
@@ -485,6 +592,15 @@ export default function ChatLayout() {
             >
               Send
             </Button>
+
+            <IconButton
+              color={isRecording ? "error" : "primary"}
+              onClick={recordAndSend}
+              disabled={isLoading}
+              sx={{ mr: 1 }}
+            >
+              <Mic />
+            </IconButton>
           </>
         )}
 
@@ -542,6 +658,40 @@ export default function ChatLayout() {
           <Button onClick={()=>setOpenQuick(false)}>취소</Button>
           <Button variant="contained" onClick={async()=>{ await quickSave(); }} disabled={!quickTitle.trim()}>저장</Button>
         </DialogActions>
+      </Dialog>
+
+      <Dialog open={!!editCid} onClose={()=>setEditCid(null)}>           {/* ★ NEW */}
+        <DialogTitle>대화 제목 변경</DialogTitle>
+        <DialogContent>
+          <TextField
+            fullWidth autoFocus
+            value={editTitle}
+            onChange={e=>setEditTitle(e.target.value)}
+            label="새 제목"
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={()=>setEditCid(null)}>취소</Button>
+          <Button variant="contained" disabled={!editTitle.trim()}
+            onClick={async()=>{
+              if(editCid){ await renameConversation(editCid, editTitle.trim()); }
+              setEditCid(null);
+            }}
+          >저장</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* ─── 녹음 중 안내 ─── */}
+      <Dialog open={isRecording} PaperProps={{ sx:{ textAlign:"center", p:3 } }}>
+        <DialogTitle sx={{ pb:1 }}>🎤 음성 명령을 말씀하세요</DialogTitle>
+        <DialogContent sx={{ display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
+          <Typography>남은 시간: <b>{recordLeft}</b>초</Typography>
+          <LinearProgress
+            variant="determinate"
+            value={(5 - recordLeft) * 20}    // 0‥100 %
+            sx={{ width:200, height:8, borderRadius:4 }}
+          />
+        </DialogContent>
       </Dialog>
 
       {/* 프로필 입력 다이얼로그 */}

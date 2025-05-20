@@ -3,9 +3,10 @@
 import os, json
 import datetime as dt
 from zoneinfo import ZoneInfo 
-import openai
+from openai import OpenAI
+import httpx
 from typing import Literal
-from pydantic import BaseModel
+from pydantic import BaseModel, constr
 from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.orm import Session
 from database import SessionLocal
@@ -27,7 +28,10 @@ except Exception:
 def tz_label(tz: dt.tzinfo) -> str:
     return getattr(tz, "key", None) or tz.tzname(None) or "UTC"
 
-openai.api_key = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_HERE")
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    http_client=httpx.Client(),          # proxies 파라미터 없음
+)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -44,6 +48,9 @@ class ToolResponse(BaseModel):
     start  : str | None = None     # ISO datetime
     end    : str | None = None
     event_id: str | None = None
+
+class TitleUpdate(BaseModel):
+    title: constr(strip_whitespace=True, min_length=1, max_length=60)
 
 # ────────────────────────────── helpers ────────────────────────────────
 def get_db():
@@ -182,16 +189,17 @@ def chat(
         }
     ]
 
-    gpt = openai.ChatCompletion.create(
+    gpt = client.chat.completions.create(
         model       = "gpt-3.5-turbo-1106",
         messages    = messages_ctx,
         functions   = functions,
         temperature = 0.7
     )
 
-    choice   = gpt.choices[0]
+    choice  = gpt.choices[0]
     finish   = choice.finish_reason
-    content  = choice.message.get("content")
+    msg     = choice.message
+    content = msg.content
 
     # ── 3‑A) 일반 답변이면 그대로 반환 ────────────────
     if finish != "function_call":
@@ -208,7 +216,7 @@ def chat(
         }
 
     # ── 3‑B) function‑call 인 경우 ──────────────────
-    call   = choice.message.function_call
+    call   = msg.function_call
     name   = call.name                    # "create_event" | "delete_event"
     args   = json.loads(call.arguments or "{}")   # str → dict
 
@@ -487,13 +495,13 @@ def summarize_conversation_title(db: Session, convo: models.Conversation):
         {"role": "user", "content": joined_text}
     ]
     try:
-        resp = openai.ChatCompletion.create(
+        resp = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=messages,
             max_tokens=30,
             temperature=0.6
         )
-        new_title = resp.choices[0].message["content"].strip()
+        new_title = resp.choices[0].message.content.strip()
     except:
         new_title = "(Untitled)"
 
@@ -504,3 +512,50 @@ def summarize_conversation_title(db: Session, convo: models.Conversation):
     # DB 반영
     convo.title = new_title
     db.commit()
+
+
+@router.patch("/conversations/{conversation_id}", status_code=200)
+def rename_conversation(
+    conversation_id: int,
+    payload: TitleUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user_token),
+):
+    """
+    PATCH /chat/conversations/{id}
+    바디: { "title": "새 제목" }
+    """
+    convo = (
+        db.query(models.Conversation)
+        .filter_by(id=conversation_id, user_id=current_user.id)
+        .first()
+    )
+    if not convo:
+        raise HTTPException(404, "Conversation not found or not yours")
+
+    convo.title = payload.title
+    db.commit()
+    return {"conversation_id": convo.id, "title": convo.title}
+
+
+@router.delete("/conversations/{conversation_id}", status_code=204)
+def delete_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user_token),
+):
+    """
+    DELETE /chat/conversations/{id}
+    대화 · 메시지 · 추천맵 전부 삭제 (SQLAlchemy cascade)
+    """
+    convo = (
+        db.query(models.Conversation)
+        .filter_by(id=conversation_id, user_id=current_user.id)
+        .first()
+    )
+    if not convo:
+        raise HTTPException(404, "Conversation not found or not yours")
+
+    db.delete(convo)
+    db.commit()
+    # 204 No Content

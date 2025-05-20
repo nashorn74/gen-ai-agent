@@ -2,7 +2,8 @@
 
 import os
 import io
-import openai
+import httpx
+from openai import OpenAI
 import pdfplumber
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
 from sqlalchemy.orm import Session
@@ -12,7 +13,10 @@ import models
 
 router = APIRouter(prefix="/summarize", tags=["summarize"])
 
-openai.api_key = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_HERE")
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    http_client=httpx.Client(),          # proxies 파라미터 없음
+)
 
 def get_db():
     db = SessionLocal()
@@ -108,11 +112,11 @@ async def summarize_file(
     ]
 
     try:
-        resp = openai.ChatCompletion.create(
+        rsp = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=messages
         )
-        summary = resp.choices[0].message["content"]
+        summary = rsp.choices[0].message.content
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI error: {str(e)}")
 
