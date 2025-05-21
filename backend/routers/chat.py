@@ -15,6 +15,8 @@ from models import Message, MessageRecommendationMap, RecCard
 from .auth import get_current_user_token  # JWT 인증 함수
 from .gcal  import build_gcal_service                  # Google service 헬퍼
 from utils.personalization import recent_feedback_summaries, make_persona_prompt
+from fastapi.responses import Response
+import base64
 
 HISTORY_CUTOFF = 12
 
@@ -169,6 +171,17 @@ def chat(
             }
         },
         {
+            "name": "generate_image",
+            "description": "When the user explicitly asks to draw/create/illustrate something, call this.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                "prompt": {"type": "string", "description": "Korean or English prompt for DALL-E 3"}
+                },
+                "required": ["prompt"]
+            }
+        },
+        {
             "name":"fetch_recommendations",
             "description":"사용자에게 구체적 영화/콘텐츠 목록을 '추천'할 때 호출하세요. "
                  "특히 질문이 '추천'·'볼만한'·'최고의 영화'·'best movie' 등을 포함하면 호출합니다.",
@@ -271,6 +284,46 @@ def chat(
                 calendarId="primary", eventId=args["event_id"]
             ).execute()
             answer = "🗑️ 일정을 삭제했어요."
+
+        elif name == "generate_image":
+            from utils.image import fetch_and_resize
+
+            full_prompt = args["prompt"]
+            # 비용 ↓: 512×512 (DALL-E 3 가능) 1장
+            img_resp = client.images.generate(
+                model="dall-e-3",
+                prompt=full_prompt,
+                n=1,
+                size="1024x1024"
+            )
+            img_url = img_resp.data[0].url
+
+            orig_b64, thumb_b64 = fetch_and_resize(img_url)
+
+            # (1) Message row
+            assistant_msg = append_and_commit(
+                db, convo, "assistant",
+                f"📷 요청하신 이미지를 생성했습니다.\n\nprompt: {full_prompt}"
+            )
+
+            # (2) MessageImage row
+            db.add(models.MessageImage(
+                message_id = assistant_msg.id,
+                prompt     = full_prompt,
+                original_b64 = orig_b64,
+                thumb_b64    = thumb_b64
+            ))
+            db.commit()
+
+            # ★ 제목 없는 대화라면 요약
+            if convo.title == "Untitled chat":
+                summarize_conversation_title(db, convo)
+
+            return {
+                "answer": "(image_created)",
+                "conversation_id": convo.id,
+                "cards": [],
+            }
 
         elif name == "fetch_recommendations":
             # 1) 인수 파싱
@@ -451,12 +504,15 @@ def get_conversation_detail(
         else:
             feedback_info = None
 
+        thumbs = [ {"image_id": im.id, "thumb": im.thumb_b64} for im in m.images ]
+
         messages.append({
             "message_id": m.id,
             "role": m.role,
             "content": m.content,
             "created_at": m.created_at,
             "cards": card_list,
+            "images": thumbs,
             "feedback": feedback_info   # ← ★ 메시지별 피드백 정보
         })
 
@@ -559,3 +615,33 @@ def delete_conversation(
     db.delete(convo)
     db.commit()
     # 204 No Content
+
+
+@router.get("/images/{image_id}", status_code=200)
+def get_original_image(
+    image_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user_token),
+):
+    """
+    원본 WebP 바이너리를 그대로 돌려준다.
+    (Auth 적용 → 내 대화의 이미지만 볼 수 있게)
+    """
+    img_row = (
+        db.query(models.MessageImage)
+        .join(models.Message, models.Message.id == models.MessageImage.message_id)
+        .join(models.Conversation, models.Conversation.id == models.Message.conversation_id)
+        .filter(
+            models.MessageImage.id == image_id,
+            models.Conversation.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not img_row:
+        raise HTTPException(404, "Image not found or not yours")
+
+    return Response(
+        content=base64.b64decode(img_row.original_b64),
+        media_type="image/webp",          # ↔ PIL 의 .save(format="WEBP")
+        headers={"Cache-Control": "public,max-age=31536000"},
+    )

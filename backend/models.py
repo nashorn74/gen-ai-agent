@@ -176,3 +176,20 @@ User.pref_genres = relationship("UserPrefGenre",
                                 cascade="all, delete-orphan")
 User.pref_tags   = relationship("UserPrefTag",
                                 cascade="all, delete-orphan")
+
+
+class MessageImage(Base):
+    __tablename__ = "message_images"
+
+    id          = Column(Integer, primary_key=True)
+    message_id  = Column(Integer, ForeignKey("messages.id"), nullable=False)
+    prompt      = Column(Text, nullable=False)
+    original_b64 = Column(Text, nullable=False)   # 512×512(원본)
+    thumb_b64    = Column(Text, nullable=False)   # 128×128(썸네일)
+
+# 양방향 관계
+Message.images = relationship(
+    "MessageImage",
+    cascade="all, delete-orphan",
+    backref="message",
+)

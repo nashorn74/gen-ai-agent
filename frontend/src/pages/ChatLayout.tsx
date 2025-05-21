@@ -22,6 +22,7 @@ import AutoSizer from "react-virtualized-auto-sizer";
 import type { Size } from "react-virtualized-auto-sizer";
 import { fetchWithAuth } from "../utils/api";
 import ProfilingDialog from "../components/ProfilingDialog";
+import { Dialog as MuiDialog, /* … */ } from "@mui/material";
 
 /* ---------- types ---------- */
 interface FeedbackInfo {
@@ -46,12 +47,17 @@ interface Message {
   content: string;
   created_at: string;
   cards?: RecommendCard[];
+  images?: ImageThumb[];
   feedback?: FeedbackInfo | null;
 }
 interface AgendaEvent {
   id: string;
   summary: string;
   start: { dateTime?: string; date?: string };
+}
+interface ImageThumb {
+  image_id: number;
+  thumb: string;          // ← 서버 키 그대로
 }
 
 /* =================================================================== */
@@ -86,6 +92,7 @@ export default function ChatLayout() {
   const [openProfileDlg, setOpenProfileDlg] = useState(false);
   const [editCid,   setEditCid]   = useState<number|null>(null);      // ★ NEW
   const [editTitle, setEditTitle] = useState("");                     // ★ NEW
+  const [fullImgUrl, setFullImgUrl] = useState<string|null>(null);
 
   /* ---------- virtualization refs ---------- */
   const listRef = useRef<VariableSizeList>(null);
@@ -404,6 +411,40 @@ export default function ChatLayout() {
             </Typography>
           )}
 
+          {m.images?.length ? (
+            <Box sx={{ mt: 1, display:"flex", gap:1, flexWrap:"wrap" }}>
+              {m.images.map(img => (
+                <Box key={img.image_id}>
+                  <img
+                    src={`data:image/webp;base64,${img.thumb}`}
+                    width={128}
+                    height={128}
+                    style={{
+                      objectFit: "cover",
+                      borderRadius: 6,
+                      cursor: "pointer",
+                    }}
+                    onLoad={(e) => {
+                      /* react-window 높이 재계산 */
+                      const h = Math.max(e.currentTarget.height, 128) + 40;
+                      setSize(index, h);
+                    }}
+                    onClick={async ()=>{
+                      // 1) 인증 토큰 포함 GET
+                      const res = await fetchWithAuth(`/chat/images/${img.image_id}`, {
+                        raw: true                           // fetchWithAuth 래퍼에 body 없는 raw 응답 옵션
+                      });
+                    
+                      // res 는 Blob (image/webp) — URL.createObjectURL 로 변환
+                      const blob = await res.blob();
+                      setFullImgUrl(URL.createObjectURL(blob));
+                    }}
+                  />
+                </Box>
+              ))}
+            </Box>
+          ) : null}
+
           {isAssistant && (
             <Box sx={{ display:"flex", gap:0.5, mt:1 }}>
               <IconButton size="small" color={iconColor(m.feedback?.feedback_label,"like")}   onClick={()=>sendMessageFeedback(m.message_id,"like")}  ><ThumbUp   fontSize="inherit"/></IconButton>
@@ -700,6 +741,28 @@ export default function ChatLayout() {
         onClose={()=>setOpenProfileDlg(false)}
         onSaved={()=>{ setProfileExists(true); setOpenProfileDlg(false); }}
       />
+
+      <MuiDialog
+        open={!!fullImgUrl}
+        onClose={()=>{
+          if(fullImgUrl){
+            URL.revokeObjectURL(fullImgUrl);     // 메모리 해제
+            setFullImgUrl(null);
+          }
+        }}
+        PaperProps={{ sx:{ p:0, background:"transparent" } }}
+      >
+        {fullImgUrl && (
+          <img
+            src={fullImgUrl}
+            style={{
+              width:512, height:512,            // 고정 512 × 512
+              objectFit:"contain",
+              display:"block"
+            }}
+          />
+        )}
+      </MuiDialog>
     </Box>
   );
 }
