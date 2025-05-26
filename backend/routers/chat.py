@@ -17,6 +17,7 @@ from .gcal  import build_gcal_service                  # Google service 헬퍼
 from utils.personalization import recent_feedback_summaries, make_persona_prompt
 from fastapi.responses import Response
 import base64
+from agent import build_agent
 
 HISTORY_CUTOFF = 12
 
@@ -74,347 +75,95 @@ def append_and_commit(db, convo, role, content):
     return msg
 
 @router.post("/", status_code=201)
-def chat(
-    req: ChatRequest,
-    db : Session       = Depends(get_db),
-    me : models.User   = Depends(get_current_user_token)
-):
-    """
-    하나의 엔드포인트에서
-    ① 일반질문   ② 일정 생성/삭제 명령(자연어) 모두 처리
-    """
+def chat(req: ChatRequest,
+         db: Session = Depends(get_db),
+         me: models.User = Depends(get_current_user_token)):
 
-    # ── 0) 대화 객체 준비 ────────────────────────────
-    if req.conversation_id:
-        convo = db.query(models.Conversation).filter_by(
-            id=req.conversation_id, user_id=me.id
-        ).first()
-        if not convo:
-            raise HTTPException(404,"Conversation not found")
-    else:
+    # 0) 대화 객체
+    convo = (db.query(models.Conversation)
+               .filter_by(id=req.conversation_id, user_id=me.id).first()
+             if req.conversation_id else None)
+    if not convo:
         convo = models.Conversation(user_id=me.id, title="Untitled chat")
         db.add(convo); db.commit(); db.refresh(convo)
 
-    # ── 1) 직전 메시지들 → GPT 컨텍스트 ───────────────
-    client_tz = ZoneInfo(req.timezone) if req.timezone else local_tz
-    now_local = dt.datetime.now(client_tz)
-    now_client = now_local.isoformat()      # 예: '2025-05-04T10:23:45.123456+09:00'
-
-    # 오늘/내일 날짜(‘YYYY-MM-DD’ 형태)
-    today_str = now_local.date().isoformat()  
-    tomorrow_str = (now_local.date() + dt.timedelta(days=1)).isoformat()
-    
-    # 2) 시스템 메시지
-    system_content = (
-        "You are an AI assistant that can also manage the user's Google Calendar.\n"
-        "If the user asks to add, update or delete an event, respond with a function‑call.\n"
-        f"⏱️ **Current client time ({tz_label(client_tz)}):** {now_client}\n"
-        "Always interpret relative Korean expressions such as 오늘/내일/모레/오후 3시에 "
-        f"the client‑side timezone (**{tz_label(client_tz)}**) and make sure the "
-        "event is in the future.\n"
-        "If the user wants some recommendation (e.g. 어떤 콘텐츠 볼까요?), call `fetch_recommendations`.\n"
-        "Otherwise, answer normally.\n\n"
-
-        # ------ 여기서 날짜 강조 ------
-        f"IMPORTANT:\n"
-        f"오늘(‘today’)은 {today_str} 입니다. "
-        f"‘내일’(tomorrow)은 {tomorrow_str} 이므로 일정 계산 시 이 사실을 준수하세요.\n"
-    )
-
-    # ▒ Personalization Block ▒
-    profile = db.query(models.UserProfile).filter_by(user_id=me.id).first()
-    persona = {
-        "locale": profile.locale if profile else "ko",
-        "genres": {g.genre: g.score for g in me.pref_genres},
-        "tags":   [{"type": t.tag_type, "tag": t.tag, "weight": t.weight}
-                   for t in me.pref_tags],
-        "recent_feedback": recent_feedback_summaries(db, me, limit=50)
-    }
-    persona_prompt = make_persona_prompt(persona)
-    messages_ctx = [
-        {"role": "system", "content": persona_prompt},
-        {"role": "system", "content": system_content}
-    ]
-    # 이전 대화(Conversation.messages) 쌓기
-    history = convo.messages[-HISTORY_CUTOFF:]
-    for m in history:
-        messages_ctx.append({"role": m.role, "content": m.content})
-
-    # 현재 user 질문 추가
-    messages_ctx.append({"role":"user","content":req.question})
+    # 1) user 메시지 저장
     append_and_commit(db, convo, "user", req.question)
 
-    # ── 2) GPT 호출 (function‑calling) ────────────────
-    functions = [
-        {
-            "name":"create_event",
-            "description":"Create a new calendar event",
-            "parameters":{
-              "type":"object",
-              "properties":{
-                "title" :{"type":"string"},
-                "start" :{"type":"string","description":"ISO datetime"},
-                "end"   :{"type":"string","description":"ISO datetime"},
-              },
-              "required":["title","start","end"]
-            }
-        },
-        {
-            "name":"delete_event",
-            "description":"Delete an existing event",
-            "parameters":{
-              "type":"object",
-              "properties":{
-                "event_id":{"type":"string"}
-              },
-              "required":["event_id"]
-            }
-        },
-        {
-            "name": "generate_image",
-            "description": "When the user explicitly asks to draw/create/illustrate something, call this.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                "prompt": {"type": "string", "description": "Korean or English prompt for DALL-E 3"}
-                },
-                "required": ["prompt"]
-            }
-        },
-        {
-            "name":"fetch_recommendations",
-            "description":"사용자에게 구체적 영화/콘텐츠 목록을 '추천'할 때 호출하세요. "
-                 "특히 질문이 '추천'·'볼만한'·'최고의 영화'·'best movie' 등을 포함하면 호출합니다.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "types": {
-                        "type": "string",
-                        "description": "콤마로 구분된 추천 타입. 예: 'content,learn'"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "가져올 카드 최대 개수"
-                    }
-                },
-                "required": ["types"]
-            }
-        }
-    ]
+    # 2) Agent 실행
+    tz  = ZoneInfo(req.timezone) if req.timezone else local_tz
+    res = build_agent(db, me, tz, convo.messages).invoke({"input": req.question})
 
-    gpt = client.chat.completions.create(
-        model       = "gpt-3.5-turbo-1106",
-        messages    = messages_ctx,
-        functions   = functions,
-        temperature = 0.7
-    )
+    # 3) 결과 해석 ────────────────◆ 여기부터 수정 ◆───────────────
+    payload: dict | None = None   # 최종 카드/이미지 JSON
+    answer, cards = "", []
+    if isinstance(res["output"], str):
+        try:
+            payload = json.loads(res["output"])
+        except json.JSONDecodeError:
+            answer = res["output"]    
 
-    choice  = gpt.choices[0]
-    finish   = choice.finish_reason
-    msg     = choice.message
-    content = msg.content
+    # (1) 이미지
+    if payload and {"original_b64", "thumb_b64"} <= payload.keys():
+        assistant_msg = append_and_commit(
+            db, convo, "assistant",
+            f"📷 요청하신 이미지를 생성했습니다.\n\nprompt: {payload.get('prompt','')}"
+        )
+        db.add(models.MessageImage(
+            message_id   = assistant_msg.id,
+            prompt       = payload.get("prompt",""),
+            original_b64 = payload["original_b64"],
+            thumb_b64    = payload["thumb_b64"],
+        ))
+        db.commit()
+        answer = "(image_created)"
 
-    # ── 3‑A) 일반 답변이면 그대로 반환 ────────────────
-    if finish != "function_call":
-        append_and_commit(db, convo, "assistant", content)
+    # (2) 추천 카드
+    elif payload and "cards" in payload:
+        cards = payload["cards"]                # [{card_id, title, …}, …]
 
-        # ★ 추가: 만약 title이 "Untitled chat" 이면 요약해서 제목으로 만들기
-        if convo.title == "Untitled chat":
-            summarize_conversation_title(db, convo)
+        # ── 1) 사람이 읽을 답변용 텍스트 ────────────────────────
+        if cards:
+            lines = [f"• {c['title']} ({c['type']})" for c in cards]
+            answer = "아래와 같은 추천 결과를 찾았습니다:\n\n" + "\n".join(lines)
+        else:
+            answer = "추천할 카드가 없네요!"
 
-        return {
-            "answer"         : content,
-            "conversation_id": convo.id,
-            "cards"          : []  # 일반 답변 시엔 카드 없음
-        }
+        # ── 2) assistant 메시지 row ────────────────────────────
+        assistant_msg = append_and_commit(db, convo, "assistant", answer)
 
-    # ── 3‑B) function‑call 인 경우 ──────────────────
-    call   = msg.function_call
-    name   = call.name                    # "create_event" | "delete_event"
-    args   = json.loads(call.arguments or "{}")   # str → dict
+        # ── 3) RecCard 존재 → 없으면 INSERT, 그리고 매핑 INSERT ─
+        for idx, c in enumerate(cards):
+            card_row = db.query(RecCard).filter_by(id=c["card_id"]).first()
+            if not card_row:
+                card_row = RecCard(
+                    id       = c["card_id"],
+                    type     = c.get("type", "content"),
+                    title    = c.get("title", "Untitled"),
+                    subtitle = c.get("subtitle", ""),
+                    url      = c.get("link", ""),
+                    reason   = c.get("reason", ""),
+                    tags     = c.get("tags", []),
+                )
+                db.add(card_row)
+                db.flush()                      # id 보장
 
-    # 구글 캘린더 연결 체크
-    if name == "create_event" or name == "delete_event":
-        token_row = db.query(models.GToken).filter_by(user_id=me.id).first()
-        if not token_row:
-            answer = "❗ Google 캘린더가 연결돼 있지 않아 일정을 처리할 수 없습니다."
-            append_and_commit(db, convo, "assistant", answer)
-
-            # ★ 추가: 제목 요약
-            if convo.title == "Untitled chat":
-                summarize_conversation_title(db, convo)
-
-            return {"answer": answer, "conversation_id": convo.id, "cards": []}
-        service = build_gcal_service(db, me.id)
-    
-    recs = []
-
-    try:
-        if name == "create_event":
-            # 필수 파라미터 검증
-            for k in ("title", "start", "end"):
-                if k not in args:
-                    raise ValueError(f"missing {k}")
-
-            start_local = dt.datetime.fromisoformat(args["start"]).replace(tzinfo=client_tz)
-            end_local   = dt.datetime.fromisoformat(args["end"]).replace(tzinfo=client_tz)
-
-            ev = service.events().insert(
-                calendarId="primary",
-                body={
-                    "summary": args["title"],
-                    "start": {
-                        "dateTime": start_local.isoformat(timespec="seconds"),
-                        "timeZone": req.timezone or tz_label(client_tz)
-                    },
-                    "end": {
-                        "dateTime": end_local.isoformat(timespec="seconds"),
-                        "timeZone": req.timezone or tz_label(client_tz)
-                    },
-                },
-            ).execute()
-            answer = (f"✅ ‘{args['title']}’ 일정을 "
-                      f"{start_local.strftime('%Y‑%m‑%d %H:%M')}에 만들었어요!")
-
-        elif name == "delete_event":
-            if "event_id" not in args:
-                raise ValueError("missing event_id")
-
-            service.events().delete(
-                calendarId="primary", eventId=args["event_id"]
-            ).execute()
-            answer = "🗑️ 일정을 삭제했어요."
-
-        elif name == "generate_image":
-            from utils.image import fetch_and_resize
-
-            full_prompt = args["prompt"]
-            # 비용 ↓: 512×512 (DALL-E 3 가능) 1장
-            img_resp = client.images.generate(
-                model="dall-e-3",
-                prompt=full_prompt,
-                n=1,
-                size="1024x1024"
-            )
-            img_url = img_resp.data[0].url
-
-            orig_b64, thumb_b64 = fetch_and_resize(img_url)
-
-            # (1) Message row
-            assistant_msg = append_and_commit(
-                db, convo, "assistant",
-                f"📷 요청하신 이미지를 생성했습니다.\n\nprompt: {full_prompt}"
-            )
-
-            # (2) MessageImage row
-            db.add(models.MessageImage(
-                message_id = assistant_msg.id,
-                prompt     = full_prompt,
-                original_b64 = orig_b64,
-                thumb_b64    = thumb_b64
+            db.add(MessageRecommendationMap(
+                message_id  = assistant_msg.id,
+                rec_card_id = card_row.id,
+                sort_order  = idx,
             ))
-            db.commit()
 
-            # ★ 제목 없는 대화라면 요약
-            if convo.title == "Untitled chat":
-                summarize_conversation_title(db, convo)
+        db.commit()
 
-            return {
-                "answer": "(image_created)",
-                "conversation_id": convo.id,
-                "cards": [],
-            }
+    else:                                                                            # 일반 텍스트
+        append_and_commit(db, convo, "assistant", answer)
 
-        elif name == "fetch_recommendations":
-            # 1) 인수 파싱
-            from routers.recommend import get_recommendations
-            types = args.get("types", "")
-            limit = args.get("limit", 5)
-
-            # 백엔드 내부 함수 직접 호출
-            try:
-                recs = get_recommendations(
-                    types = types,
-                    limit = limit,
-                    db    = db,
-                    current_user = me,
-                    tz    = client_tz,
-                    user_query = req.question,
-                )
-                # recs 는 [{"card_id","type","title","subtitle","link","reason",...}, ...]
-
-                # 예시: 채팅 답변용 텍스트
-                if not recs:
-                    answer = "추천할 카드가 없네요!"
-                else:
-                    lines = []
-                    for r in recs:
-                        lines.append(f"• {r['title']} ({r['type']}) : {r['link']}")
-                    answer = "아래와 같은 추천 결과를 찾았습니다:\n\n" + "\n".join(lines)
-
-            except Exception as e:
-                answer = f"추천 조회 중 오류: {str(e)}"
-                recs = []
-            
-            # 메시지 먼저 생성
-            assistant_msg = append_and_commit(db, convo, "assistant", answer)
-
-            # recs = [{ "card_id":"c_12903","title":"...","type":"..."}, ...]
-            for i, r in enumerate(recs):
-                # rec_cards 테이블에서 해당 card_id 가 존재하는지 확인 (없으면 생성할 수도 있음)
-                card = db.query(RecCard).filter_by(id=r["card_id"]).first()
-
-                # 만약 card 자체가 DB에 없으면, 임시로 생성 예시 (원래는 미리 DB에 있음이 일반적)
-                if not card:
-                    card = RecCard(
-                        id       = r["card_id"],
-                        type     = r.get("type","content"),
-                        title    = r.get("title","Untitled"),
-                        subtitle = r.get("subtitle",""),
-                        url      = r.get("link",""),
-                        reason   = r.get("reason",""),
-                        tags     = r.get("tags", [])
-                    )
-                    db.add(card)
-                    db.commit()
-
-                mapping = MessageRecommendationMap(
-                    message_id = assistant_msg.id,
-                    rec_card_id = card.id,
-                    sort_order  = i
-                )
-                db.add(mapping)
-
-            db.commit()
-
-            # ★ 타이틀 요약
-            if convo.title == "Untitled chat":
-                summarize_conversation_title(db, convo)
-
-            return {
-                "answer": answer,
-                "conversation_id": convo.id,
-                "cards": recs
-            }
-
-        else:                                  # 정의되지 않은 함수명
-            answer = "⚠️ 알 수 없는 function call"
-
-    except Exception as e:
-        answer = f"function call 처리 중 오류: {e}"
-
-    # DB에 assistant 메시지로 저장
-    append_and_commit(db, convo, "assistant", answer)
-
-    # ★ 타이틀 요약
+    # 4) Untitled 일 때 제목 요약
     if convo.title == "Untitled chat":
         summarize_conversation_title(db, convo)
 
-    return {
-        "answer"         : answer,
-        "conversation_id": convo.id,
-        "cards"          : recs
-    }
+    return {"conversation_id": convo.id, "answer": answer, "cards": cards}
 
 @router.get("/conversations")
 def get_conversations(
