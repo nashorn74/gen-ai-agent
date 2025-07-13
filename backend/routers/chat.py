@@ -17,7 +17,7 @@ from .gcal  import build_gcal_service                  # Google service 헬퍼
 from utils.personalization import recent_feedback_summaries, make_persona_prompt
 from fastapi.responses import Response
 import base64
-from agent import build_agent
+from agent import build_agent, run_lcel_once
 
 HISTORY_CUTOFF = 12
 
@@ -43,6 +43,7 @@ class ChatRequest(BaseModel):
     conversation_id: int | None = None
     question:        str
     timezone:        str | None = None    # ex. "Europe/Berlin"
+    plan_mode:       bool = True
 
 class ToolResponse(BaseModel):
     """GPT function‑call 이 내려올 경우 파라미터 스키마"""
@@ -92,7 +93,11 @@ def chat(req: ChatRequest,
 
     # 2) Agent 실행
     tz  = ZoneInfo(req.timezone) if req.timezone else local_tz
-    res = build_agent(db, me, tz, convo.messages).invoke({"input": req.question})
+    if req.plan_mode:
+        res = run_lcel_once(db, me, tz, user_input=req.question)
+    else:
+        # 기존 단일-스텝 에이전트
+        res = build_agent(db, me, tz, convo.messages).invoke({"input": req.question})
 
     # 3) 결과 해석 ────────────────◆ 여기부터 수정 ◆───────────────
     payload: dict | None = None   # 최종 카드/이미지 JSON

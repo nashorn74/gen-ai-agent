@@ -10,13 +10,17 @@ from openai import OpenAI, AsyncOpenAI
 import httpx
 
 from langchain_openai import ChatOpenAI
-from langchain.memory import ConversationBufferMemory
+from langchain.memory import ConversationTokenBufferMemory
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.agents import create_openai_tools_agent, AgentExecutor
 from langchain.schema import SystemMessage
 from langchain_core.tools import BaseTool
 from langchain_core.tools import tool  # ⬅️ 데코레이터
 from pydantic import BaseModel, Field
+
+from .tools import make_toolset
+from .planner import create_planner_prompt, plan_output_parser
+from .executor import StepExecutor
 
 import models
 from routers.gcal import build_gcal_service
@@ -49,12 +53,20 @@ class _AsyncChat:
     async def create(self, **kwargs):
         return await _async_root.chat.completions.create(**kwargs)
 
-
+# 일반 에이전트용 LLM
 _llm = ChatOpenAI(
     model="gpt-3.5-turbo",
     temperature=0.2,
     client=_SyncChat(),
     async_client=_AsyncChat(),
+)
+
+# ✅ [수정] 플래너 전용 LLM을 여기서 중앙 관리합니다.
+_planner_llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.2,
+    client=_SyncChat(),      # 올바르게 설정된 클라이언트 재사용
+    async_client=_AsyncChat(), # 올바르게 설정된 클라이언트 재사용
 )
 
 # ── pydantic 스키마 ───────────────────────────
@@ -78,127 +90,6 @@ class RecArgs(BaseModel):
     limit: int = 5
 # ─────────────────────────────────────────────
 
-
-# ─────────────────────────── tool 세트
-def _make_toolset(db: Session, user: models.User, tz: ZoneInfo):
-
-    @tool(args_schema=CreateEventArgs, return_direct=True)
-    def create_event(title: str, start: str, end: str) -> str:
-        """Google Calendar 일정 생성. 사용자가 일정, 미팅, 약속 등을 잡아달라고 할 때 항상 사용하세요.
-        
-        title: 일정 제목 (예: "팀 회의", "점심 약속")
-        start: ISO-8601 시작 시간 (예: "2025-05-26T13:00:00+02:00")
-        end: ISO-8601 종료 시간 (예: "2025-05-26T14:00:00+02:00")
-        
-        일정 생성은 항상 미래 시간에만 가능합니다.
-        """
-        print("---------------------------------------")
-        print("create_event 호출됨!")
-        print(f"매개변수: title={title}, start={start}, end={end}")
-        print("---------------------------------------")
-        try:
-            # 1) ISO → datetime
-            try:
-                dt_start = dt.datetime.fromisoformat(start)
-                dt_end = dt.datetime.fromisoformat(end)
-            except ValueError as e:
-                print(f"ISO 파싱 실패: {start}, {end}, 오류: {e}")
-                return f"❗ 날짜 형식이 올바르지 않습니다: {e}"
-
-            # 2) 타임존 처리
-            if dt_start.tzinfo is None:
-                dt_start = dt_start.replace(tzinfo=tz)
-            if dt_end.tzinfo is None:
-                dt_end = dt_end.replace(tzinfo=tz)
-            
-            # 3) 현재 시간
-            now = dt.datetime.now(tz)
-            print(f"시간 비교: 시작={dt_start}, 현재={now}")
-            
-            # 4) 미래 일정 확인 (10분 이내는 허용)
-            if dt_start < now - dt.timedelta(minutes=10):
-                return f"❗ 과거 시간({dt_start.strftime('%Y-%m-%d %H:%M')})에는 일정을 추가할 수 없습니다. 현재 시간은 {now.strftime('%Y-%m-%d %H:%M')}입니다."
-            
-            # 5) Google Calendar API 호출
-            svc = build_gcal_service(db, user.id)
-            print(f"일정 생성 시도: {title}, {dt_start} ~ {dt_end}")
-            ev = svc.events().insert(
-                calendarId="primary",
-                body={
-                    "summary": title,
-                    "start": {"dateTime": dt_start.isoformat(), "timeZone": str(tz)},
-                    "end": {"dateTime": dt_end.isoformat(), "timeZone": str(tz)},
-                },
-            ).execute()
-
-            result = f"✅ 일정 생성 완료 → {dt_start.strftime('%Y-%m-%d %H:%M')} ~ {dt_end.strftime('%H:%M')} {ev.get('htmlLink')}"
-            print(result)
-            return result
-        except Exception as e:
-            print(f"일정 생성 오류: {e}")
-            return f"❗ 일정 생성 중 오류가 발생했습니다: {str(e)}"
-
-    @tool(args_schema=DeleteEventArgs, return_direct=True)
-    def delete_event(event_id: str) -> str:
-        """event_id 로 Google Calendar 이벤트를 삭제한다."""
-        svc = build_gcal_service(db, user.id)
-        svc.events().delete(calendarId="primary", eventId=event_id).execute()
-        return "🗑️ 일정이 삭제되었습니다."
-
-    @tool(args_schema=WebSearchArgs)
-    def web_search(query: str, k: int = 5) -> str:
-        """Google CSE 로 웹을 검색하고 상위 k개 링크를 돌려준다."""
-        items = google_search_cse(query=query, num=k, date_restrict="m6", sort="date")
-        return "\n".join(f"{it['title']} – {it['link']}" for it in items) or "No results"
-
-    @tool(args_schema=GenImgArgs, return_direct=True)
-    def generate_image(prompt: str) -> str:
-        """DALL-E 3 로 이미지를 생성해 base64 JSON 을 돌려준다."""
-        try:
-            resp = _sync_root.images.generate(
-                model="dall-e-3", prompt=prompt, n=1, size="1024x1024"
-            )
-            url = resp.data[0].url
-            orig, thumb = fetch_and_resize(url)
-            payload = {
-                "prompt": prompt,
-                "original_b64": orig,
-                "thumb_b64": thumb,
-            }
-            return json.dumps(payload, ensure_ascii=False)   # ★ 반드시 str!
-        except Exception as e:
-            return json.dumps({"error": f"이미지 생성 실패: {e}"}, ensure_ascii=False)
-
-    @tool(args_schema=RecArgs, return_direct=True)
-    def fetch_recommendations(types: str, limit: int = 5) -> str:
-        """
-        ONLY USE THIS TOOL when the user EXPLICITLY asks for content recommendations or suggestions.
-        
-        APPROPRIATE USES:
-        - User asks "뭐 볼까?" (What should I watch?)
-        - User says "영화 추천해줘" (Recommend me a movie)
-        - User asks for options or suggestions for content to consume
-        
-        DO NOT USE FOR:
-        - Technical questions like "React란 무엇인가?"
-        - Factual information queries like "TypeScript의 장점은?"
-        - General knowledge or explanations
-        
-        This tool returns personalized content recommendation cards as JSON.
-        """
-        from routers.recommend import get_recommendations
-        recs = get_recommendations(
-            types=types, limit=limit, db=db, current_user=user, tz=tz, user_query=""
-        )
-        return json.dumps({"cards": recs}, ensure_ascii=False)
-
-    return [
-        create_event,
-        delete_event,
-        web_search,
-        generate_image,
-        fetch_recommendations,
-    ]
 
 def tz_label(tz: dt.tzinfo) -> str:
     return getattr(tz, "key", None) or tz.tzname(None) or "UTC"
@@ -335,10 +226,12 @@ def build_agent(
     tz: ZoneInfo = ZoneInfo("UTC"),
     history: list[models.Message] | None = None,
 ) -> AgentExecutor:
-    # 1) memory (최근 15개, 이미지/카드/확인메시지 제거)
-    memory = ConversationBufferMemory(
+    # 1) Memory – 토큰 기반 윈도우 (≈ 1 200 tokens)
+    memory = ConversationTokenBufferMemory(
+        llm=_llm,
         memory_key="chat_history",
         input_key="input",
+        max_token_limit=1200,
         return_messages=True,
     )
     for role, text in _clean_history(history or []):
@@ -346,11 +239,11 @@ def build_agent(
          else memory.chat_memory.add_ai_message)(text)
 
     # 2) tools & prompt
-    tools  = _make_toolset(db, user, tz)
+    tools  = make_toolset(db, user, tz, _sync_root, _llm)
     prompt = build_prompt(tools, tz)
 
     # 3) agent → executor
-    agent   = create_openai_tools_agent(_llm, tools, prompt)   # ✅ system_message 안 넘김
+    agent = create_openai_tools_agent(_llm, tools, prompt)
     exec_   = AgentExecutor(
         agent   = agent,
         tools   = tools,
@@ -361,3 +254,97 @@ def build_agent(
         early_stopping_method = "force",  # 더 확실한 제어
     )
     return exec_
+
+# examples 부분에 추가
+#User: "다음 달 주말에 볼 만한 전시회 추천하고 일정 잡아줘"
+#Assistant (plan):
+#{
+# "steps":[
+#   {"tool":"web_search","args":{"query":"서울 전시회 2025-08", "k":10}},
+#   {"tool":"fetch_recommendations","args":{"types":"content","limit":5}},
+#   {"tool":"create_event","args":{
+#      "title":"데이비드 호크니 전",
+#      "start":"2025-08-16T14:00:00+09:00",
+#      "end":"2025-08-16T16:00:00+09:00"}}
+# ]
+#}
+
+# ───────── LCEL 기반 Plan-and-Execute 1-회 실행 ──────────
+def run_lcel_once(
+    db: Session,
+    user: models.User,
+    tz: ZoneInfo,
+    history: list[models.Message] | None = None,
+    user_input: str | None = None,
+) -> dict:
+    """
+    LLM이 계획을 세우고(Plan), 각 단계를 순차적으로 실행(Execute)합니다.
+    """
+    # ── 0) 입력 확정 ──────────────────────────────────────
+    if user_input is None:
+        if not history:
+            raise ValueError("run_lcel_once: history or user_input is required.")
+        
+        last_user_message_content = None
+        for message in reversed(history):
+            if message.role == 'user':
+                last_user_message_content = message.content
+                break
+        
+        if last_user_message_content is None:
+            return {"output": "이전 대화에서 사용자님의 메시지를 찾을 수 없습니다."}
+        user_input = last_user_message_content
+
+    # ── 1) 플래너 호출 (계획 수립) ─────────────────────────
+    # ‼️ [수정] 현재 시간을 기준으로 동적으로 프롬프트를 생성
+    now_in_client_tz = dt.datetime.now(tz)
+    plan_prompt = create_planner_prompt(current_time_str=now_in_client_tz.isoformat())
+    
+    plan_chain = plan_prompt | _planner_llm | plan_output_parser
+
+    print("\n" + "=" * 70)
+    print(f"🕵️ 1. PLANNER INPUT: '{user_input}'")
+    
+    prompt_value = plan_prompt.invoke({"input": user_input})
+    print("\n" + "-" * 25 + " 💌 FINAL PROMPT TO LLM " + "-" * 25)
+    for message in prompt_value.to_messages():
+        print(f"[{message.type.upper()}]")
+        print(message.content)
+        print("---")
+    print("-" * 75)
+
+    # 파싱 전 LLM 원본 답변 확인
+    raw_plan = (plan_prompt | _planner_llm).invoke({"input": user_input})
+    print("\n" + "-" * 25 + " 🤖 RAW LLM OUTPUT " + "-" * 26)
+    print(raw_plan.content)
+    print("-" * 75)
+
+    try:
+        plan = plan_output_parser.parse(raw_plan.content)
+        print("\n📝 2. PARSED PLAN:\n", json.dumps(plan, indent=2, ensure_ascii=False))
+    except Exception as e:
+        print(f"\n❌ ERROR: Failed to parse LLM output into JSON. Error: {e}")
+        return {"output": "에이전트가 응답을 생성하는 데 실패했습니다. (JSON 파싱 오류)"}
+
+    # ── 2) 단계별 실행 (Executor 사용) ───────────────────
+    step_executor = StepExecutor(db, user, tz, _planner_llm, _sync_root)
+
+    step_outputs: dict[str, str] = {}
+    logs: list[dict] = []
+
+    if not plan.get("steps"):
+        print("\n🤷 NO STEPS TO EXECUTE. Returning default response.")
+    else:
+        for idx, step in enumerate(plan.get("steps", [])):
+            result = step_executor.execute_step(step, step_outputs)
+            step_key = f"step_{idx + 1}_output"
+            step_outputs[step_key] = result.get("output", "")
+            logs.append(result)
+
+    print("=" * 70 + "\n")
+
+    # ── 3) 최종 출력 ────────────────────────────────────
+    if logs:
+        return {"output": logs[-1].get("output", "실행은 완료되었지만 결과가 없습니다.")}
+    
+    return {"output": "알겠습니다. 어떻게 도와드릴까요?"}
