@@ -319,12 +319,35 @@ def run_lcel_once(
     print(raw_plan.content)
     print("-" * 75)
 
+    # 1) JSON 파싱
     try:
         plan = plan_output_parser.parse(raw_plan.content)
-        print("\n📝 2. PARSED PLAN:\n", json.dumps(plan, indent=2, ensure_ascii=False))
     except Exception as e:
-        print(f"\n❌ ERROR: Failed to parse LLM output into JSON. Error: {e}")
-        return {"output": "에이전트가 응답을 생성하는 데 실패했습니다. (JSON 파싱 오류)"}
+        print(f"[WARN] plan_output_parser failed: {e}")
+        # 아주 단순 fallback (코드펜스 제거 정도)
+        import re
+        txt = raw_plan.content.strip()
+        if txt.startswith("```"):
+            # ```json / ``` 로 둘러싸인 경우 제거
+            txt = re.sub(r"^```(?:json)?", "", txt).strip()
+            if txt.endswith("```"):
+                txt = txt[:-3].strip()
+        try:
+            plan = json.loads(txt)
+        except Exception as e2:
+            print(f"\n❌ ERROR: Failed to parse plan JSON. {e2}")
+            return {"output": "에이전트가 응답을 생성하는 데 실패했습니다. (plan parse)"}
+
+    # 2) (선택) 플랜 사전 조정
+    try:
+        from .plan_validate import adjust_plan_if_needed
+        adjusted = adjust_plan_if_needed(plan, user_input)
+        if adjusted:
+            print("[PLAN ADJUST] plan modified (e.g., inserted weather step)")
+    except Exception as ve:
+        print(f"[VALIDATOR ERROR] {ve}")
+
+    print("\n📝 2. PARSED PLAN:\n", json.dumps(plan, indent=2, ensure_ascii=False))
 
     # ── 2) 단계별 실행 (Executor 사용) ───────────────────
     step_executor = StepExecutor(db, user, tz, _planner_llm, _sync_root)
@@ -343,8 +366,68 @@ def run_lcel_once(
 
     print("=" * 70 + "\n")
 
-    # ── 3) 최종 출력 ────────────────────────────────────
+    # ── 3) 최종 출력 (모든 스텝 결과 조합) ─────────────────────────
     if logs:
-        return {"output": logs[-1].get("output", "실행은 완료되었지만 결과가 없습니다.")}
-    
+        # step_outputs 안에는 각 step_i_output 문자열이 있음
+        weather_raw = None
+        event_raw   = None
+        title_raw   = None            # extract_best_title 결과
+
+        # 1) 날씨 스텝 탐색
+        for i, step in enumerate(plan.get("steps", []), start=1):
+            if step.get("tool") in ("get_weather", "weather", "mcp_get_weather"):
+                weather_raw = step_outputs.get(f"step_{i}_output")
+
+            if step.get("tool") == "create_event":
+                event_raw = step_outputs.get(f"step_{i}_output")
+
+            if step.get("tool") == "extract_best_title":
+                title_raw = step_outputs.get(f"step_{i}_output")
+
+        # 2) 날씨 JSON → 요약
+        weather_summary = None
+        if weather_raw:
+            try:
+                # weather_raw 가 이미 dict string 이면
+                if isinstance(weather_raw, dict):
+                    w = weather_raw
+                else:
+                    w = json.loads(weather_raw) if weather_raw.strip().startswith("{") else {}
+                if isinstance(w, dict):
+                    temp = w.get("temp")
+                    ws   = w.get("windspeed")
+                    code = w.get("conditions_code")
+                    loc  = w.get("location")
+                    weather_summary = f"{loc or '지역'} 현재 예상 기온 {temp}°C, 풍속 {ws} m/s (code {code})"
+            except Exception:
+                # 파싱 실패 → 원 문자열 일부만
+                weather_summary = f"날씨 정보: {str(weather_raw)[:120]}"
+
+        # 3) 추출된 제목 정리
+        # title_raw 자체는 순수 문자열 (예: '84제곱미터')
+        # 노이즈 또는 너무 긴 경우 슬라이스
+        if isinstance(title_raw, str):
+            clean_title = title_raw.strip().strip('"').splitlines()[0][:80]
+        else:
+            clean_title = None
+
+        # 3) 이벤트 메시지 정제 (create_event 결과는 이미 사람이 읽는 문장)
+        event_msg = event_raw or ""
+
+        # 4) 최종 조립
+        parts = []
+        if weather_summary:
+            parts.append(weather_summary)
+        elif weather_raw:
+            parts.append(str(weather_raw))
+        
+        if clean_title:
+            parts.append(f"선택된 추천 제목: {clean_title}")
+
+        if event_msg:
+            parts.append(event_msg)
+
+        final_answer = "\n".join(parts) if parts else logs[-1].get("output", "실행은 완료되었지만 결과가 없습니다.")
+        return {"output": final_answer}
+
     return {"output": "알겠습니다. 어떻게 도와드릴까요?"}

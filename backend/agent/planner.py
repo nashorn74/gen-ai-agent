@@ -22,6 +22,8 @@ _TOOL_SPEC = dedent("""
     - args: {% raw %}{{"prompt": "<이미지 생성 프롬프트>"}}{% endraw %}
 7.  **extract_best_title**: 검색 결과에서 가장 적절한 제목 하나만 깔끔하게 추출합니다. 일정 제목을 만들 때 사용하세요.
     - args: {% raw %}{{"text_to_process": "<이전 단계의 텍스트 결과>"}}{% endraw %}
+8.  **get_weather**: 지정한 도시의 현재 기온과 날씨 코드를 JSON 으로 반환합니다.
+    - args: {"location": "<도시명>", "units": "metric"}
 """).strip()
 
 # ‼️ [수정] .format()을 사용하지 않고 안전하게 프롬프트를 조립하는 함수
@@ -49,6 +51,14 @@ def create_planner_prompt(current_time_str: str) -> ChatPromptTemplate:
     3.  For multi-part requests (e.g., "find X and schedule it"), first use a search tool, then use `create_event`.
     4.  If an argument's value depends on a previous step's output, use the placeholder `{% raw %}{{step_N_output}}{% endraw %}`.
     5.  You must respond **only** with the JSON object.
+    6. If the user asks to schedule an outdoor / weather-dependent event (keywords: "야외","날씨","기상","비 올","우천"), you MUST first call `get_weather` (if available). Only create the calendar event AFTER obtaining weather info. If `get_weather` tool is unavailable, use `web_search` with a weather query first.
+    7. Never create an event before gathering mandatory context (e.g., weather) required to decide feasibility.
+    8. If user gives a Korean city name (예: "서울"), convert to its standard English form (Seoul) before calling `get_weather`.
+    9.  **`extract_best_title` MUST NEVER appear as the first step or be used alone.** It can ONLY be used *immediately after* a `web_search` or `fetch_recommendations` step, consuming that direct output via {% raw %}{{step_N_output}}{% endraw %}.  
+        - If the user asks a simple factual / definitional / explanatory / translation / yes-no question that does **not** require selecting a single title, DO NOT use `extract_best_title`.  
+        - If you only need to schedule an event with an explicitly given title (e.g., "내일 3시에 팀 회의 잡아줘"), DO NOT use `extract_best_title`.  
+        - INVALID patterns: `[{"tool":"extract_best_title", ...}]`, or having it after `create_event`, or separated from the search by unrelated steps.
+        - VALID pattern: `web_search` -> `extract_best_title` -> `create_event`.
 
     ## EXAMPLE
     USER: "이번 주말에 볼만한 액션 영화를 찾아서, 토요일 저녁 8시에 보도록 일정에 추가해줘."

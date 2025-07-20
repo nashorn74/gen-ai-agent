@@ -14,6 +14,7 @@ import models
 from routers.gcal import build_gcal_service
 from routers.search import google_search_cse
 from utils.image import fetch_and_resize
+from .mcp_loader import load_mcp_tools
 
 # Pydantic 스키마 (기존 __init__.py에서 이동)
 class CreateEventArgs(BaseModel):
@@ -173,7 +174,7 @@ def make_toolset(db: Session, user: models.User, tz: ZoneInfo, openai_client, ll
             # 실패 시 기본값 반환
             return "선택된 항목"
 
-    return [
+    base_tools = [
         create_event,
         delete_event,
         web_search,
@@ -181,3 +182,8 @@ def make_toolset(db: Session, user: models.User, tz: ZoneInfo, openai_client, ll
         fetch_recommendations,
         extract_best_title,
     ]
+
+    # MCP 로드 (실패해도 base_tools 그대로)
+    mcp_tools = load_mcp_tools(host=os.getenv("MCP_HOST","mcp-weather"),
+                               port=int(os.getenv("MCP_PORT","7001")))
+    return base_tools + mcp_tools
